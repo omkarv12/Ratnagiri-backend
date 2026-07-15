@@ -24,25 +24,35 @@ def index():
 @bp.route('/api/locations', methods=['GET'])
 def get_locations():
     try:
-        result = db.session.execute(text("""
-SELECT
-    id,
-    location_name,
-    village_name,
-    taluka_name,
-    district_name,
-    attraction_type,
-    category,                                    
-    nearest_landmark,
-    road_condition,
-    signboards_available,
-    seasonal_availability,
-    avg_time_spent,
-    photo_location,
-    latitude,
-    longitude
-FROM locations
-""")).mappings().all()
+        taluka = request.args.get('taluka', 'All')
+        attraction_type = request.args.get('type', 'All Types')
+        search = request.args.get('q', '')
+
+        query = text("""
+            SELECT
+                id, location_name, village_name, taluka_name, district_name,
+                attraction_type, category, nearest_landmark, road_condition,
+                signboards_available, seasonal_availability, avg_time_spent,
+                photo_location, latitude, longitude
+            FROM locations
+            WHERE (:taluka = 'All' OR taluka_name = :taluka)
+              AND (:attraction_type = 'All Types' OR attraction_type = :attraction_type)
+              AND (
+                    :search = '' OR
+                    location_name ILIKE :search_like OR
+                    village_name ILIKE :search_like OR
+                    nearest_landmark ILIKE :search_like
+              )
+            ORDER BY location_name
+        """)
+
+        result = db.session.execute(query, {
+            "taluka": taluka,
+            "attraction_type": attraction_type,
+            "search": search,
+            "search_like": f"%{search}%"
+        }).mappings().all()
+
         return jsonify([dict(row) for row in result]), 200
     except Exception as e:
         return jsonify({"error": str(e)}), 500
@@ -50,7 +60,31 @@ FROM locations
 @bp.route('/api/homestays', methods=['GET'])
 def get_homestays():
     try:
-        result = db.session.execute(text("SELECT * FROM homestays")).mappings().all()
+        taluka = request.args.get('taluka', 'All')
+        homestay_type = request.args.get('type', 'All Types')
+        search = request.args.get('q', '')
+
+        query = text("""
+            SELECT *
+            FROM homestays
+            WHERE (:taluka = 'All' OR taluka_name = :taluka)
+              AND (:homestay_type = 'All Types' OR homestay_type = :homestay_type)
+              AND (
+                    :search = '' OR
+                    homestay_name ILIKE :search_like OR
+                    village_town_city ILIKE :search_like OR
+                    owner_name ILIKE :search_like
+              )
+            ORDER BY homestay_name
+        """)
+
+        result = db.session.execute(query, {
+            "taluka": taluka,
+            "homestay_type": homestay_type,
+            "search": search,
+            "search_like": f"%{search}%"
+        }).mappings().all()
+
         return jsonify([dict(row) for row in result]), 200
     except Exception as e:
         return jsonify({"error": str(e)}), 500
@@ -64,45 +98,21 @@ def get_eco():
         return jsonify({"error": str(e)}), 500
     
 
+
+
 @bp.route('/api/dashboard', methods=['GET'])
 def get_dashboard():
     try:
 
         locations = db.session.execute(text("""
-            SELECT
-                id,
-                location_name,
-                village_name,
-                taluka_name,
-                district_name,
-                attraction_type,
-                category,
-                nearest_landmark,
-                road_condition,
-                signboards_available,
-                seasonal_availability,
-                avg_time_spent,
-                photo_location,
-                latitude,
-                longitude
-            FROM locations
-        """)).mappings().all()
+    SELECT *
+    FROM locations
+""")).mappings().all()
 
         homestays = db.session.execute(text("""
-    SELECT
-        id,
-        homestay_name,
-        owner_name,
-        phone_number,
-        village_town_city,
-        taluka_name,
-        homestay_type,
-        facilities_services,
-        photo_homestay,
-        latitude,
-        longitude
-    FROM homestays
-""")).mappings().all()
+            SELECT *
+            FROM homestays
+        """)).mappings().all()
 
         eco = db.session.execute(text("""
             SELECT *
@@ -798,3 +808,48 @@ def get_photo(file_id):
             "success": False,
             "error": str(e)
         }), 500
+    
+@bp.route('/api/talukas', methods=['GET'])
+def get_talukas():
+    try:
+        result = db.session.execute(text("""
+            SELECT DISTINCT taluka_name
+            FROM locations
+            WHERE taluka_name IS NOT NULL AND taluka_name <> ''
+            UNION
+            SELECT DISTINCT taluka_name
+            FROM homestays
+            WHERE taluka_name IS NOT NULL AND taluka_name <> ''
+            ORDER BY taluka_name
+        """)).all()
+        return jsonify([row[0] for row in result]), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@bp.route('/api/attraction-types', methods=['GET'])
+def get_attraction_types():
+    try:
+        result = db.session.execute(text("""
+            SELECT DISTINCT attraction_type
+            FROM locations
+            WHERE attraction_type IS NOT NULL AND attraction_type <> ''
+            ORDER BY attraction_type
+        """)).all()
+        return jsonify([row[0] for row in result]), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@bp.route('/api/homestay-types', methods=['GET'])
+def get_homestay_types():
+    try:
+        result = db.session.execute(text("""
+            SELECT DISTINCT homestay_type
+            FROM homestays
+            WHERE homestay_type IS NOT NULL AND homestay_type <> ''
+            ORDER BY homestay_type
+        """)).all()
+        return jsonify([row[0] for row in result]), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
