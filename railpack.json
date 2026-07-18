@@ -1,5 +1,1 @@
-{
-  "start": {
-    "command": "gunicorn run:app --bind 0.0.0.0:$PORT"
-  }
-}
+﻿{"start":{"command":"gunicorn run:app --bind 0.0.0.0:$PORT"},"build":{"env":{"MISE_PYTHON_GITHUB_ATTESTATIONS":"false"}}}
