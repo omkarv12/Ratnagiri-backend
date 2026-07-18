@@ -9,19 +9,30 @@ from googleapiclient.http import MediaIoBaseDownload
 SCOPES = ["https://www.googleapis.com/auth/drive.readonly"]
 
 
+import json
+
 def get_drive_service():
-    credentials_path = os.getenv(
-    "GOOGLE_APPLICATION_CREDENTIALS",
-    "/etc/secrets/service-account.json"
-    )
+    service_account_json = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
 
-    if not os.path.exists(credentials_path):
-        credentials_path = "service-account.json"
+    if service_account_json:
+        credentials_info = json.loads(service_account_json)
+        credentials = service_account.Credentials.from_service_account_info(
+            credentials_info,
+            scopes=SCOPES
+        )
+    else:
+        credentials_path = os.getenv(
+            "GOOGLE_APPLICATION_CREDENTIALS",
+            "/etc/secrets/service-account.json"
+        )
 
-    credentials = service_account.Credentials.from_service_account_file(
-        credentials_path,
-        scopes=SCOPES
-    )
+        if not os.path.exists(credentials_path):
+            credentials_path = "service-account.json"
+
+        credentials = service_account.Credentials.from_service_account_file(
+            credentials_path,
+            scopes=SCOPES
+        )
 
     service = build(
         "drive",
