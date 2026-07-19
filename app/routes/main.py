@@ -88,8 +88,9 @@ def get_homestays():
         return jsonify([dict(row) for row in result]), 200
     except Exception as e:
         return jsonify({"error": str(e)}), 500
-    
-    @bp.route('/api/drivers/register', methods=['POST'])
+
+
+@bp.route('/api/drivers/register', methods=['POST'])
 def register_driver():
     try:
         data = request.get_json()
