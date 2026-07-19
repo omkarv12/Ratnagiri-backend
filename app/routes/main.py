@@ -206,6 +206,67 @@ def get_eco():
         return jsonify([dict(row) for row in result]), 200
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
+
+@bp.route('/api/bus_stops/register', methods=['POST'])
+def register_bus_stop():
+    try:
+        data = request.get_json()
+        google_maps_link = data.get("google_maps_link")
+
+        try:
+            latitude, longitude = extract_coordinates_from_google_maps(google_maps_link)
+        except Exception:
+            latitude = None
+            longitude = None
+
+        # Allow manually entered lat/lng to override/fill in if the maps link didn't resolve
+        if latitude is None and data.get("latitude") not in (None, ""):
+            latitude = data.get("latitude")
+        if longitude is None and data.get("longitude") not in (None, ""):
+            longitude = data.get("longitude")
+
+        query = text("""
+            INSERT INTO bus_stops (
+                stop_name, taluka_name, district_name,
+                google_maps_link, latitude, longitude, timetable_link
+            )
+            VALUES (
+                :stop_name, :taluka_name, :district_name,
+                :google_maps_link, :latitude, :longitude, :timetable_link
+            )
+        """)
+
+        db.session.execute(query, {
+            "stop_name": data.get("stop_name"),
+            "taluka_name": data.get("taluka_name"),
+            "district_name": data.get("district_name", "Ratnagiri"),
+            "google_maps_link": google_maps_link,
+            "latitude": latitude,
+            "longitude": longitude,
+            "timetable_link": data.get("timetable_link"),
+        })
+        db.session.commit()
+
+        return jsonify({
+            "success": True,
+            "message": "Bus stand added successfully."
+        }), 201
+
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@bp.route('/api/bus_stops', methods=['GET'])
+def get_bus_stops():
+    try:
+        result = db.session.execute(text("""
+            SELECT * FROM bus_stops ORDER BY stop_name
+        """)).mappings().all()
+        return jsonify([dict(row) for row in result]), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
     
 
 
@@ -234,6 +295,11 @@ def get_dashboard():
             FROM drivers
         """)).mappings().all()
 
+        bus_stops = db.session.execute(text("""
+            SELECT *
+            FROM bus_stops
+        """)).mappings().all()
+
         return jsonify({
 
             "locations": [dict(row) for row in locations],
@@ -242,7 +308,9 @@ def get_dashboard():
 
             "eco": [dict(row) for row in eco],
 
-            "drivers": [dict(row) for row in drivers]
+            "drivers": [dict(row) for row in drivers],
+
+            "bus_stops": [dict(row) for row in bus_stops]
 
         }), 200
 
