@@ -88,6 +88,115 @@ def get_homestays():
         return jsonify([dict(row) for row in result]), 200
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+    
+    @bp.route('/api/drivers/register', methods=['POST'])
+def register_driver():
+    try:
+        data = request.get_json()
+        google_maps_link = data.get("google_maps_link")
+
+        try:
+            latitude, longitude = extract_coordinates_from_google_maps(google_maps_link)
+        except Exception:
+            latitude = None
+            longitude = None
+
+        query = text("""
+            INSERT INTO pending_drivers (
+                driver_name, phone_number, vehicle_type, vehicle_number,
+                base_village, taluka_name, district_name, service_area,
+                per_day_rate, google_maps_link, latitude, longitude,
+                vehicle_photos
+            )
+            VALUES (
+                :driver_name, :phone_number, :vehicle_type, :vehicle_number,
+                :base_village, :taluka_name, :district_name, :service_area,
+                :per_day_rate, :google_maps_link, :latitude, :longitude,
+                :vehicle_photos
+            )
+        """)
+
+        db.session.execute(query, {
+            "driver_name": data.get("driver_name"),
+            "phone_number": data.get("phone_number"),
+            "vehicle_type": data.get("vehicle_type"),
+            "vehicle_number": data.get("vehicle_number"),
+            "base_village": data.get("base_village"),
+            "taluka_name": data.get("taluka_name"),
+            "district_name": data.get("district_name", "Ratnagiri"),
+            "service_area": data.get("service_area"),
+            "per_day_rate": data.get("per_day_rate"),
+            "google_maps_link": google_maps_link,
+            "latitude": latitude,
+            "longitude": longitude,
+            "vehicle_photos": data.get("vehicle_photos"),
+        })
+        db.session.commit()
+
+        return jsonify({
+            "success": True,
+            "message": "Driver submitted successfully. Waiting for admin approval."
+        }), 201
+
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@bp.route('/api/pending_drivers', methods=['GET'])
+def get_pending_drivers():
+    try:
+        result = db.session.execute(text("""
+            SELECT * FROM pending_drivers ORDER BY submitted_at DESC
+        """)).mappings().all()
+        return jsonify([dict(row) for row in result]), 200
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@bp.route('/api/pending_drivers/<int:id>/approve', methods=['POST'])
+def approve_driver(id):
+    try:
+        pending = db.session.execute(
+            text("SELECT * FROM pending_drivers WHERE id=:id"), {"id": id}
+        ).mappings().first()
+
+        if pending is None:
+            return jsonify({"success": False, "error": "Pending driver not found."}), 404
+
+        data = dict(pending)
+        data.pop("id", None)
+        data.pop("submitted_at", None)
+
+        columns = ", ".join(data.keys())
+        values = ", ".join([f":{k}" for k in data.keys()])
+
+        db.session.execute(
+            text(f"INSERT INTO drivers ({columns}) VALUES ({values})"), data
+        )
+        db.session.execute(
+            text("DELETE FROM pending_drivers WHERE id=:id"), {"id": id}
+        )
+        db.session.commit()
+
+        return jsonify({"success": True, "message": "Driver copied to drivers table."}), 200
+
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@bp.route('/api/pending_drivers/<int:id>/reject', methods=['POST'])
+def reject_driver(id):
+    try:
+        db.session.execute(
+            text("DELETE FROM pending_drivers WHERE id = :id"), {"id": id}
+        )
+        db.session.commit()
+        return jsonify({"success": True, "message": "Driver rejected and removed successfully."}), 200
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({"success": False, "error": str(e)}), 500
 
 @bp.route('/api/eco', methods=['GET'])
 def get_eco():
@@ -119,13 +228,20 @@ def get_dashboard():
             FROM eco_and_water
         """)).mappings().all()
 
+        drivers = db.session.execute(text("""
+            SELECT *
+            FROM drivers
+        """)).mappings().all()
+
         return jsonify({
 
             "locations": [dict(row) for row in locations],
 
             "homestays": [dict(row) for row in homestays],
 
-            "eco": [dict(row) for row in eco]
+            "eco": [dict(row) for row in eco],
+
+            "drivers": [dict(row) for row in drivers]
 
         }), 200
 
