@@ -1,3 +1,4 @@
+import os
 from flask import Blueprint, jsonify, request, send_file
 from sqlalchemy import text
 from app import db
@@ -6,6 +7,14 @@ from google.oauth2 import id_token
 from google.auth.transport import requests as grequests
 
 from app.utils.map_utils import extract_coordinates_from_google_maps
+import cloudinary
+import cloudinary.uploader
+
+cloudinary.config(
+    cloud_name=os.environ.get('CLOUDINARY_CLOUD_NAME'),
+    api_key=os.environ.get('CLOUDINARY_API_KEY'),
+    api_secret=os.environ.get('CLOUDINARY_API_SECRET')
+)
 
 from app.drive_service import (
     find_folder_by_name,
@@ -45,6 +54,7 @@ def get_locations():
               )
             ORDER BY location_name
         """)
+        
 
         result = db.session.execute(query, {
             "taluka": taluka,
@@ -825,7 +835,7 @@ def register_homestay():
             "unit_type": data.get("homestay_unit_type"),
             "homestay_type": data.get("homestay_type"),
             "discoverable_google_map": data.get("google_maps_discoverable"),
-            "photo_homestay": data.get("photo_location"),
+            "photo_homestay": data.get("site_photos"),
             "registered_mtdc": data.get("mtdc_registered"),
 
             "accept_bookings": data.get("booking_method"),
@@ -845,7 +855,7 @@ def register_homestay():
             "local_experiences": data.get("local_experiences"),
 
             "social_media_page": data.get("social_media_link"),
-            "amenities_photos": data.get("homestay_photos"),
+            "amenities_photos": data.get("site_photos"),
             "google_map_link": data.get("google_maps_link"),
             "latitude": latitude,
             "longitude": longitude
@@ -1038,3 +1048,21 @@ def get_homestay_types():
         return jsonify([row[0] for row in result]), 200
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
+
+@bp.route('/api/upload-photo', methods=['POST'])
+def upload_photo():
+    try:
+        if 'photo' not in request.files:
+            return jsonify({"success": False, "error": "No file provided"}), 400
+
+        file = request.files['photo']
+        result = cloudinary.uploader.upload(file)
+
+        return jsonify({
+            "success": True,
+            "url": result['secure_url']
+        }), 200
+
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500   
