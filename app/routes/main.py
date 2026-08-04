@@ -336,15 +336,15 @@ def get_dashboard():
 def register_location():
     try:
         data = request.get_json()
-        google_maps_link = data.get("google_maps_link")
 
-        try:
-            latitude, longitude = extract_coordinates_from_google_maps(
-            google_maps_link
-    )
-        except Exception:
-            latitude = None
-            longitude = None
+        latitude = data.get("latitude")
+        longitude = data.get("longitude")
+
+        if latitude is None or longitude is None:
+            return jsonify({
+                "success": False,
+                "error": "Location coordinates are required."
+            }), 400
 
         query = text("""
     INSERT INTO pending_locations (
