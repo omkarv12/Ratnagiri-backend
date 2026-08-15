@@ -519,8 +519,40 @@ def register_location():
             "error": str(e)
         }), 500
 
+@bp.route('/api/counts', methods=['GET'])
+def get_counts():
+    try:
+        location_count = db.session.execute(text("SELECT COUNT(*) FROM locations")).scalar()
+        homestay_count = db.session.execute(text("SELECT COUNT(*) FROM homestays")).scalar()
+        pending_location_count = db.session.execute(text("SELECT COUNT(*) FROM pending_locations")).scalar()
+        pending_homestay_count = db.session.execute(text("SELECT COUNT(*) FROM pending_homestays")).scalar()
+ 
+        return jsonify({
+            "locations": location_count or 0,
+            "homestays": homestay_count or 0,
+            "pending_locations": pending_location_count or 0,
+            "pending_homestays": pending_homestay_count or 0
+        }), 200
+ 
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500        
+@bp.route('/api/counts', methods=['GET'])
+def get_counts():
+    try:
+        location_count = db.session.execute(text("SELECT COUNT(*) FROM locations")).scalar()
+        homestay_count = db.session.execute(text("SELECT COUNT(*) FROM homestays")).scalar()
+        pending_location_count = db.session.execute(text("SELECT COUNT(*) FROM pending_locations")).scalar()
+        pending_homestay_count = db.session.execute(text("SELECT COUNT(*) FROM pending_homestays")).scalar()
+ 
+        return jsonify({
+            "locations": location_count or 0,
+            "homestays": homestay_count or 0,
+            "pending_locations": pending_location_count or 0,
+            "pending_homestays": pending_homestay_count or 0
+        }), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
         
-    
 @bp.route('/api/pending_locations', methods=['GET'])
 def get_pending_locations():
     try:
