@@ -42,7 +42,7 @@ def get_locations():
                 id, location_name, village_name, taluka_name, district_name,
                 attraction_type, category, nearest_landmark, road_condition,
                 signboards_available, seasonal_availability, avg_time_spent,
-                photo_location, latitude, longitude
+                photo_location, site_photos, latitude, longitude
             FROM locations
             WHERE (:taluka = 'All' OR taluka_name = :taluka)
               AND (:attraction_type = 'All Types' OR attraction_type = :attraction_type)
