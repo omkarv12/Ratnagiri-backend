@@ -99,7 +99,7 @@ def get_homestays():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
     
-@app.route('/api/nearby-locations/<location_name>')
+@bp.route('/api/nearby-locations/<location_name>')
 def get_nearby_locations(location_name):
     cur = conn.cursor()
     cur.execute(
