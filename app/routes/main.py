@@ -98,7 +98,18 @@ def get_homestays():
         return jsonify([dict(row) for row in result]), 200
     except Exception as e:
         return jsonify({"error": str(e)}), 500
-
+    
+@app.route('/api/nearby-locations/<location_name>')
+def get_nearby_locations(location_name):
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT nearby_name, lat, lng FROM nearby_locations WHERE main_location = %s",
+        (location_name,)
+    )
+    rows = cur.fetchall()
+    nearby = [{"name": r[0], "lat": r[1], "lng": r[2]} for r in rows]
+    cur.close()
+    return jsonify({"success": True, "nearby": nearby})
 
 @bp.route('/api/drivers/register', methods=['POST'])
 def register_driver():
