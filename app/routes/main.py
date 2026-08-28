@@ -9,6 +9,26 @@ from google.auth.transport import requests as grequests
 from app.utils.map_utils import extract_coordinates_from_google_maps
 import cloudinary
 import cloudinary.uploader
+import re
+
+def slugify(text_value):
+    text_value = text_value.lower().strip()
+    text_value = re.sub(r'[^a-z0-9]+', '-', text_value)
+    return text_value.strip('-') or 'post'
+
+def unique_slug(base, table):
+    base_slug = slugify(base)
+    candidate = base_slug
+    i = 2
+    while True:
+        exists = db.session.execute(
+            text(f"SELECT 1 FROM {table} WHERE slug = :slug"),
+            {"slug": candidate}
+        ).first()
+        if not exists:
+            return candidate
+        candidate = f"{base_slug}-{i}"
+        i += 1
 
 cloudinary.config(
     cloud_name=os.environ.get('CLOUDINARY_CLOUD_NAME'),
@@ -293,7 +313,286 @@ def get_bus_stops():
         return jsonify({"error": str(e)}), 500
     
 
+@bp.route('/api/blog-categories', methods=['GET'])
+def list_blog_categories():
+    try:
+        result = db.session.execute(text("""
+            SELECT c.id, c.name, c.slug,
+                   COUNT(b.id) FILTER (WHERE b.status = 'published') AS post_count
+            FROM blog_categories c
+            LEFT JOIN blogs b ON b.category_id = c.id
+            GROUP BY c.id, c.name, c.slug
+            ORDER BY c.name
+        """)).mappings().all()
+        return jsonify([dict(row) for row in result]), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
+
+@bp.route('/api/blogs', methods=['GET'])
+def list_blogs():
+    try:
+        latest = request.args.get('latest')
+        if latest:
+            limit = int(latest)
+            result = db.session.execute(text("""
+                SELECT id, title, slug, cover_image, published_at
+                FROM blogs
+                WHERE status = 'published'
+                ORDER BY published_at DESC
+                LIMIT :limit
+            """), {"limit": limit}).mappings().all()
+            return jsonify([dict(row) for row in result]), 200
+
+        category = request.args.get('category', 'All')
+        search = request.args.get('search', '')
+        page = int(request.args.get('page', 1))
+        limit = int(request.args.get('limit', 6))
+        offset = (page - 1) * limit
+
+        base_query = """
+            FROM blogs b
+            LEFT JOIN blog_categories c ON c.id = b.category_id
+            WHERE b.status = 'published'
+              AND (:category = 'All' OR c.slug = :category)
+              AND (:search = '' OR b.title ILIKE :search_like OR b.excerpt ILIKE :search_like)
+        """
+        params = {
+            "category": category, "search": search,
+            "search_like": f"%{search}%", "limit": limit, "offset": offset,
+        }
+
+        total = db.session.execute(text(f"SELECT COUNT(*) {base_query}"), params).scalar()
+
+        rows = db.session.execute(text(f"""
+            SELECT b.id, b.title, b.slug, b.excerpt, b.cover_image, b.author_name,
+                   b.published_at, b.views,
+                   c.id AS category_id, c.name AS category_name, c.slug AS category_slug,
+                   (SELECT COUNT(*) FROM blog_comments cm WHERE cm.blog_id = b.id) AS comment_count
+            {base_query}
+            ORDER BY b.published_at DESC
+            LIMIT :limit OFFSET :offset
+        """), params).mappings().all()
+
+        blogs = []
+        for row in rows:
+            row = dict(row)
+            category_obj = None
+            if row.get("category_id"):
+                category_obj = {"id": row["category_id"], "name": row["category_name"], "slug": row["category_slug"]}
+            blogs.append({
+                "id": row["id"], "title": row["title"], "slug": row["slug"],
+                "excerpt": row["excerpt"], "cover_image": row["cover_image"],
+                "author_name": row["author_name"], "published_at": row["published_at"],
+                "views": row["views"], "comment_count": row["comment_count"],
+                "category": category_obj,
+            })
+
+        total_pages = max(1, (total + limit - 1) // limit)
+        return jsonify({"blogs": blogs, "total": total, "total_pages": total_pages}), 200
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@bp.route('/api/blogs/<slug>', methods=['GET'])
+def get_blog(slug):
+    try:
+        row = db.session.execute(text("""
+            SELECT b.*, c.id AS cat_id, c.name AS cat_name, c.slug AS cat_slug
+            FROM blogs b
+            LEFT JOIN blog_categories c ON c.id = b.category_id
+            WHERE b.slug = :slug AND b.status = 'published'
+        """), {"slug": slug}).mappings().first()
+
+        if row is None:
+            return jsonify({"error": "Story not found."}), 404
+
+        db.session.execute(text("UPDATE blogs SET views = views + 1 WHERE id = :id"), {"id": row["id"]})
+        db.session.commit()
+
+        comments = db.session.execute(text("""
+            SELECT id, name, comment, created_at
+            FROM blog_comments WHERE blog_id = :blog_id
+            ORDER BY created_at DESC
+        """), {"blog_id": row["id"]}).mappings().all()
+
+        data = dict(row)
+        category_obj = None
+        if data.get("cat_id"):
+            category_obj = {"id": data["cat_id"], "name": data["cat_name"], "slug": data["cat_slug"]}
+        data["category"] = category_obj
+        for k in ("cat_id", "cat_name", "cat_slug"):
+            data.pop(k, None)
+        data["comments"] = [dict(c) for c in comments]
+
+        return jsonify(data), 200
+
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({"error": str(e)}), 500
+
+
+@bp.route('/api/blogs/<int:blog_id>/comments', methods=['POST'])
+def add_blog_comment(blog_id):
+    try:
+        data = request.get_json()
+        name = (data.get("name") or "").strip()
+        comment = (data.get("comment") or "").strip()
+        email = (data.get("email") or "").strip() or None
+
+        if not name or not comment:
+            return jsonify({"success": False, "error": "Name and comment are required."}), 400
+
+        db.session.execute(text("""
+            INSERT INTO blog_comments (blog_id, name, email, comment)
+            VALUES (:blog_id, :name, :email, :comment)
+        """), {"blog_id": blog_id, "name": name, "email": email, "comment": comment})
+        db.session.commit()
+
+        return jsonify({"success": True}), 201
+
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@bp.route('/api/admin/blogs', methods=['GET'])
+def admin_list_blogs():
+    try:
+        rows = db.session.execute(text("""
+            SELECT b.id, b.title, b.slug, b.status, b.published_at, b.views,
+                   c.id AS category_id, c.name AS category_name
+            FROM blogs b
+            LEFT JOIN blog_categories c ON c.id = b.category_id
+            ORDER BY b.created_at DESC
+        """)).mappings().all()
+
+        blogs = []
+        for row in rows:
+            row = dict(row)
+            category_obj = {"id": row["category_id"], "name": row["category_name"]} if row.get("category_id") else None
+            blogs.append({
+                "id": row["id"], "title": row["title"], "slug": row["slug"],
+                "status": row["status"], "published_at": row["published_at"],
+                "views": row["views"], "category": category_obj,
+            })
+        return jsonify(blogs), 200
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@bp.route('/api/admin/blogs', methods=['POST'])
+def admin_create_blog():
+    try:
+        data = request.get_json()
+        title = (data.get("title") or "").strip()
+        content = (data.get("content") or "").strip()
+
+        if not title or not content:
+            return jsonify({"success": False, "error": "Title and content are required."}), 400
+
+        slug = unique_slug(title, "blogs")
+        status = data.get("status", "draft")
+        published_at_clause = "NOW()" if status == "published" else "NULL"
+
+        result = db.session.execute(text(f"""
+            INSERT INTO blogs (title, slug, excerpt, content, cover_image, author_name, category_id, status, published_at)
+            VALUES (:title, :slug, :excerpt, :content, :cover_image, :author_name, :category_id, :status, {published_at_clause})
+            RETURNING id
+        """), {
+            "title": title, "slug": slug,
+            "excerpt": data.get("excerpt") or None,
+            "content": content,
+            "cover_image": data.get("cover_image") or None,
+            "author_name": data.get("author_name") or None,
+            "category_id": data.get("category_id") or None,
+            "status": status,
+        })
+        new_id = result.scalar()
+        db.session.commit()
+
+        return jsonify({"success": True, "id": new_id, "slug": slug}), 201
+
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@bp.route('/api/admin/blogs/<int:id>', methods=['PUT'])
+def admin_update_blog(id):
+    try:
+        data = request.get_json()
+        existing = db.session.execute(
+            text("SELECT status, published_at FROM blogs WHERE id = :id"), {"id": id}
+        ).mappings().first()
+
+        if existing is None:
+            return jsonify({"success": False, "error": "Story not found."}), 404
+
+        status = data.get("status", existing["status"])
+        set_published = ", published_at = NOW()" if (status == "published" and existing["published_at"] is None) else ""
+
+        db.session.execute(text(f"""
+            UPDATE blogs SET
+                title = :title, excerpt = :excerpt, content = :content,
+                cover_image = :cover_image, author_name = :author_name,
+                category_id = :category_id, status = :status, updated_at = NOW()
+                {set_published}
+            WHERE id = :id
+        """), {
+            "title": (data.get("title") or "").strip(),
+            "excerpt": data.get("excerpt") or None,
+            "content": data.get("content") or "",
+            "cover_image": data.get("cover_image") or None,
+            "author_name": data.get("author_name") or None,
+            "category_id": data.get("category_id") or None,
+            "status": status, "id": id,
+        })
+        db.session.commit()
+
+        return jsonify({"success": True}), 200
+
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@bp.route('/api/admin/blogs/<int:id>', methods=['DELETE'])
+def admin_delete_blog(id):
+    try:
+        db.session.execute(text("DELETE FROM blogs WHERE id = :id"), {"id": id})
+        db.session.commit()
+        return jsonify({"success": True}), 200
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@bp.route('/api/admin/blog-categories', methods=['POST'])
+def admin_create_category():
+    try:
+        data = request.get_json()
+        name = (data.get("name") or "").strip()
+        if not name:
+            return jsonify({"success": False, "error": "Category name is required."}), 400
+
+        slug = unique_slug(name, "blog_categories")
+
+        result = db.session.execute(text("""
+            INSERT INTO blog_categories (name, slug)
+            VALUES (:name, :slug)
+            RETURNING id, name, slug
+        """), {"name": name, "slug": slug})
+        row = result.mappings().first()
+        db.session.commit()
+
+        return jsonify(dict(row)), 201
+
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({"success": False, "error": str(e)}), 500
 
 @bp.route('/api/dashboard', methods=['GET'])
 def get_dashboard():
