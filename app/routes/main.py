@@ -1,4 +1,5 @@
 import os
+import requests as http_requests
 from flask import Blueprint, jsonify, request, send_file
 from sqlalchemy import text
 from app import db
@@ -50,6 +51,53 @@ def index():
         "message": "Antigravity Flask Backend Initialized Ready for PostGIS"
     }), 200
 
+@bp.route('/api/youtube-videos', methods=['GET'])
+def get_youtube_videos():
+    try:
+        playlist_id = os.environ.get('YOUTUBE_PLAYLIST_ID')
+        api_key = os.environ.get('YOUTUBE_API_KEY')
+
+        if not playlist_id or not api_key:
+            return jsonify({"success": False, "error": "YouTube playlist not configured."}), 500
+
+        response = http_requests.get(
+            "https://www.googleapis.com/youtube/v3/playlistItems",
+            params={
+                "part": "snippet",
+                "playlistId": playlist_id,
+                "maxResults": 25,
+                "key": api_key,
+            }
+        )
+        data = response.json()
+
+        if "error" in data:
+            return jsonify({"success": False, "error": data["error"].get("message", "YouTube API error.")}), 502
+
+        videos = []
+        for item in data.get("items", []):
+            snippet = item.get("snippet", {})
+            video_id = snippet.get("resourceId", {}).get("videoId")
+            if not video_id:
+                continue
+            thumbnails = snippet.get("thumbnails", {})
+            thumbnail = (
+                thumbnails.get("high") or thumbnails.get("medium") or thumbnails.get("default") or {}
+            ).get("url")
+
+            videos.append({
+                "video_id": video_id,
+                "title": snippet.get("title"),
+                "description": snippet.get("description"),
+                "thumbnail": thumbnail,
+                "published_at": snippet.get("publishedAt"),
+            })
+
+        return jsonify({"success": True, "videos": videos}), 200
+
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+    
 @bp.route('/api/locations', methods=['GET'])
 def get_locations():
     try:
