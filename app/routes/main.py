@@ -3,6 +3,7 @@ import requests as http_requests
 from flask import Blueprint, jsonify, request, send_file
 from sqlalchemy import text
 from app import db
+import json
 
 from google.oauth2 import id_token
 from google.auth.transport import requests as grequests
@@ -96,6 +97,104 @@ def get_youtube_videos():
         return jsonify({"success": True, "videos": videos}), 200
 
     except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@bp.route('/api/village-profile/<taluka>/<village>', methods=['GET'])
+def get_village_profile(taluka, village):
+    try:
+        row = db.session.execute(text("""
+            SELECT * FROM village_profiles
+            WHERE taluka_name = :taluka AND village_name = :village
+        """), {"taluka": taluka, "village": village}).mappings().first()
+
+        if row is None:
+            return jsonify({"success": True, "profile": None}), 200
+
+        return jsonify({"success": True, "profile": dict(row)}), 200
+
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@bp.route('/api/admin/village-profiles', methods=['GET'])
+def admin_list_village_profiles():
+    try:
+        result = db.session.execute(text("""
+            SELECT id, taluka_name, village_name, tagline, updated_at
+            FROM village_profiles ORDER BY taluka_name, village_name
+        """)).mappings().all()
+        return jsonify([dict(row) for row in result]), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@bp.route('/api/admin/village-profile', methods=['POST'])
+def admin_save_village_profile():
+    try:
+        data = request.get_json()
+        taluka = (data.get("taluka_name") or "").strip()
+        village = (data.get("village_name") or "").strip()
+
+        if not taluka or not village:
+            return jsonify({"success": False, "error": "Taluka and village name are required."}), 400
+
+                params = {
+            "taluka_name": taluka,
+            "village_name": village,
+            "tagline": data.get("tagline"),
+            "intro_text": data.get("intro_text"),
+            "about_text": data.get("about_text"),
+            "hero_image": data.get("hero_image"),
+            "top_attractions": json.dumps(data.get("top_attractions", [])),
+            "experiences": json.dumps(data.get("experiences", [])),
+            "services": json.dumps(data.get("services", [])),
+            "how_to_reach_road": data.get("how_to_reach_road"),
+            "how_to_reach_rail": data.get("how_to_reach_rail"),
+            "how_to_reach_air": data.get("how_to_reach_air"),
+            "best_time_to_visit": data.get("best_time_to_visit"),
+            "sustainability_tips": json.dumps(data.get("sustainability_tips", [])),
+            "stay_options_text": data.get("stay_options_text"),
+            "stay_options_image": data.get("stay_options_image"),
+            "hashtags": data.get("hashtags"),
+        }
+
+        db.session.execute(text("""
+            INSERT INTO village_profiles (
+                taluka_name, village_name, tagline, intro_text, about_text, hero_image,
+                top_attractions, experiences, services, how_to_reach_road, how_to_reach_rail,
+                how_to_reach_air, best_time_to_visit, sustainability_tips,
+                stay_options_text, stay_options_image, hashtags
+            ) VALUES (
+                :taluka_name, :village_name, :tagline, :intro_text, :about_text, :hero_image,
+                :top_attractions, :experiences, :services, :how_to_reach_road, :how_to_reach_rail,
+                :how_to_reach_air, :best_time_to_visit, :sustainability_tips,
+                :stay_options_text, :stay_options_image, :hashtags
+            )
+            ON CONFLICT (taluka_name, village_name) DO UPDATE SET
+                tagline = EXCLUDED.tagline,
+                intro_text = EXCLUDED.intro_text,
+                about_text = EXCLUDED.about_text,
+                hero_image = EXCLUDED.hero_image,
+                top_attractions = EXCLUDED.top_attractions,
+                experiences = EXCLUDED.experiences,
+                services = EXCLUDED.services,
+                how_to_reach_road = EXCLUDED.how_to_reach_road,
+                how_to_reach_rail = EXCLUDED.how_to_reach_rail,
+                how_to_reach_air = EXCLUDED.how_to_reach_air,
+                best_time_to_visit = EXCLUDED.best_time_to_visit,
+                sustainability_tips = EXCLUDED.sustainability_tips,
+                stay_options_text = EXCLUDED.stay_options_text,
+                stay_options_image = EXCLUDED.stay_options_image,
+                hashtags = EXCLUDED.hashtags,
+                updated_at = NOW()
+        """), params)
+        db.session.commit()
+
+        return jsonify({"success": True}), 200
+
+    except Exception as e:
+        db.session.rollback()
         return jsonify({"success": False, "error": str(e)}), 500
     
 @bp.route('/api/locations', methods=['GET'])
