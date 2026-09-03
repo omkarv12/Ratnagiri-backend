@@ -99,6 +99,17 @@ def get_youtube_videos():
     except Exception as e:
         return jsonify({"success": False, "error": str(e)}), 500
 
+@bp.route('/api/village-profiles', methods=['GET'])
+def list_village_profiles():
+    try:
+        result = db.session.execute(text("""
+            SELECT taluka_name, village_name, tagline, hero_image
+            FROM village_profiles
+            ORDER BY taluka_name, village_name
+        """)).mappings().all()
+        return jsonify([dict(row) for row in result]), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 @bp.route('/api/village-profile/<taluka>/<village>', methods=['GET'])
 def get_village_profile(taluka, village):
