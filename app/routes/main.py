@@ -139,7 +139,7 @@ def admin_save_village_profile():
         if not taluka or not village:
             return jsonify({"success": False, "error": "Taluka and village name are required."}), 400
 
-                params = {
+        params = {
             "taluka_name": taluka,
             "village_name": village,
             "tagline": data.get("tagline"),
