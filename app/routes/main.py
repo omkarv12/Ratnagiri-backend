@@ -139,6 +139,22 @@ def admin_list_village_profiles():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
+@bp.route('/api/admin/village-profile/<taluka>/<village>', methods=['DELETE'])
+def admin_delete_village_profile(taluka, village):
+    try:
+        result = db.session.execute(text("""
+            DELETE FROM village_profiles
+            WHERE taluka_name = :taluka AND village_name = :village
+        """), {"taluka": taluka, "village": village})
+        db.session.commit()
+
+        if result.rowcount == 0:
+            return jsonify({"success": False, "error": "Profile not found."}), 404
+
+        return jsonify({"success": True, "message": "Village profile deleted."}), 200
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({"success": False, "error": str(e)}), 500
 
 @bp.route('/api/admin/village-profile', methods=['POST'])
 def admin_save_village_profile():
