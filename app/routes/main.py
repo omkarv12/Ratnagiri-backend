@@ -4,7 +4,7 @@ from flask import Blueprint, jsonify, request, send_file
 from sqlalchemy import text
 from app import db
 import json
-
+from datetime import date
 from google.oauth2 import id_token
 from google.auth.transport import requests as grequests
 
@@ -44,6 +44,153 @@ from app.drive_service import (
     get_image_bytes,
 )
 bp = Blueprint('main', __name__)
+from datetime import date
+EVENT_CATEGORIES = {"beaches", "forts", "temples", "waterfalls", "mangoes"}
+
+
+@bp.route('/api/events', methods=['GET'])
+def list_events():
+    """Approved events for one month: /api/events?year=2026&month=11"""
+    try:
+        year = int(request.args["year"])
+        month = int(request.args["month"])
+        start = date(year, month, 1)
+        end = date(year + (month == 12), month % 12 + 1, 1)
+    except (KeyError, ValueError):
+        return jsonify({"error": "year and month are required"}), 400
+
+    try:
+        result = db.session.execute(text("""
+            SELECT id, title, event_date::text AS event_date, category,
+                   organizer_name, description
+            FROM tourism_events
+            WHERE status = 'approved'
+              AND event_date >= :start AND event_date < :end
+            ORDER BY event_date, id
+        """), {"start": start, "end": end}).mappings().all()
+        return jsonify([dict(row) for row in result]), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@bp.route('/api/events/upcoming', methods=['GET'])
+def upcoming_events():
+    """Next approved events from today: /api/events/upcoming?limit=12"""
+    try:
+        try:
+            limit = min(int(request.args.get("limit", 12)), 50)
+        except ValueError:
+            limit = 12
+
+        result = db.session.execute(text("""
+            SELECT id, title, event_date::text AS event_date, category,
+                   organizer_name, description
+            FROM tourism_events
+            WHERE status = 'approved' AND event_date >= CURRENT_DATE
+            ORDER BY event_date, id
+            LIMIT :limit
+        """), {"limit": limit}).mappings().all()
+        return jsonify([dict(row) for row in result]), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@bp.route('/api/events/contribute', methods=['POST'])
+def contribute_event():
+    try:
+        data = request.get_json(silent=True) or {}
+
+        title = (data.get("title") or "").strip()
+        event_date = (data.get("event_date") or "").strip()
+        category = (data.get("category") or "").strip()
+        organizer_name = (data.get("organizer_name") or "").strip()
+        organizer_contact = (data.get("organizer_contact") or "").strip()
+
+        if not (title and event_date and organizer_name and organizer_contact):
+            return jsonify({"success": False, "error": "Please fill all required fields"}), 400
+        if category not in EVENT_CATEGORIES:
+            return jsonify({"success": False, "error": "Invalid category"}), 400
+        try:
+            date.fromisoformat(event_date)
+        except ValueError:
+            return jsonify({"success": False, "error": "Invalid date"}), 400
+
+        result = db.session.execute(text("""
+            INSERT INTO tourism_events
+                (title, event_date, category, organizer_name,
+                 organizer_contact, organizer_email, description)
+            VALUES
+                (:title, :event_date, :category, :organizer_name,
+                 :organizer_contact, :organizer_email, :description)
+            RETURNING id
+        """), {
+            "title": title[:200],
+            "event_date": event_date,
+            "category": category,
+            "organizer_name": organizer_name[:150],
+            "organizer_contact": organizer_contact[:20],
+            "organizer_email": (data.get("organizer_email") or "").strip()[:150] or None,
+            "description": (data.get("description") or "").strip() or None,
+        })
+        new_id = result.scalar()
+        db.session.commit()
+
+        return jsonify({"success": True, "id": new_id, "status": "pending"}), 201
+
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+# ---------------- Admin: review contributions ----------------
+
+@bp.route('/api/admin/events', methods=['GET'])
+def admin_list_events():
+    """/api/admin/events?status=pending  (pending | approved | rejected | all)"""
+    try:
+        status = request.args.get("status", "pending")
+        result = db.session.execute(text("""
+            SELECT id, title, event_date::text AS event_date, category,
+                   organizer_name, organizer_contact, organizer_email,
+                   description, status, created_at
+            FROM tourism_events
+            WHERE (:status = 'all' OR status = :status)
+            ORDER BY created_at DESC
+        """), {"status": status}).mappings().all()
+        return jsonify([dict(row) for row in result]), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@bp.route('/api/admin/events/<int:id>/approve', methods=['POST'])
+def admin_approve_event(id):
+    try:
+        result = db.session.execute(text("""
+            UPDATE tourism_events
+            SET status = 'approved', approved_at = NOW()
+            WHERE id = :id
+        """), {"id": id})
+        db.session.commit()
+
+        if result.rowcount == 0:
+            return jsonify({"success": False, "error": "Event not found."}), 404
+        return jsonify({"success": True, "message": "Event approved."}), 200
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@bp.route('/api/admin/events/<int:id>/reject', methods=['POST'])
+def admin_reject_event(id):
+    try:
+        db.session.execute(
+            text("DELETE FROM tourism_events WHERE id = :id"), {"id": id}
+        )
+        db.session.commit()
+        return jsonify({"success": True, "message": "Event rejected and removed."}), 200
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({"success": False, "error": str(e)}), 500
 
 @bp.route('/', methods=['GET'])
 def index():
@@ -155,6 +302,7 @@ def admin_delete_village_profile(taluka, village):
     except Exception as e:
         db.session.rollback()
         return jsonify({"success": False, "error": str(e)}), 500
+        
 
 @bp.route('/api/admin/village-profile', methods=['POST'])
 def admin_save_village_profile():
