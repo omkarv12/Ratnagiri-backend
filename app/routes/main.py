@@ -45,6 +45,30 @@ from app.drive_service import (
 )
 bp = Blueprint('main', __name__)
 
+
+def _resolve_coordinates(data, maps_link):
+    """Prefer the pin dropped on the form's map; fall back to parsing a Google Maps link."""
+    lat, lng = data.get("latitude"), data.get("longitude")
+    if lat not in (None, "") and lng not in (None, ""):
+        return lat, lng
+    try:
+        return extract_coordinates_from_google_maps(maps_link)
+    except Exception:
+        return None, None
+
+
+# Fields collected from the public that must never be returned by public endpoints.
+PRIVATE_FIELDS = {
+    "locations": {"phone_number", "email_address", "user_type", "suggestions_improvements", "job_type"},
+    "homestays": {"email", "suggestions_improvements"},
+    "drivers": {"email"},
+}
+
+
+def _public_rows(rows, kind):
+    hidden = PRIVATE_FIELDS[kind]
+    return [{k: v for k, v in dict(r).items() if k not in hidden} for r in rows]
+
 EVENT_CATEGORIES = {"beaches", "forts", "temples", "waterfalls", "mangoes"}
 
 
@@ -451,7 +475,7 @@ def get_homestays():
             "search_like": f"%{search}%"
         }).mappings().all()
 
-        return jsonify([dict(row) for row in result]), 200
+        return jsonify(_public_rows(result, "homestays")), 200
     except Exception as e:
         return jsonify({"error": str(e)}), 500
     
@@ -475,25 +499,20 @@ def register_driver():
     try:
         data = request.get_json()
         google_maps_link = data.get("google_maps_link")
-
-        try:
-            latitude, longitude = extract_coordinates_from_google_maps(google_maps_link)
-        except Exception:
-            latitude = None
-            longitude = None
+        latitude, longitude = _resolve_coordinates(data, google_maps_link)
 
         query = text("""
             INSERT INTO pending_drivers (
                 driver_name, phone_number, vehicle_type, vehicle_number,
                 base_village, taluka_name, district_name, service_area,
                 per_day_rate, google_maps_link, latitude, longitude,
-                vehicle_photos
+                vehicle_photos, driver_photo, vehicle_photo, number_plate_photo, email
             )
             VALUES (
                 :driver_name, :phone_number, :vehicle_type, :vehicle_number,
                 :base_village, :taluka_name, :district_name, :service_area,
                 :per_day_rate, :google_maps_link, :latitude, :longitude,
-                :vehicle_photos
+                :vehicle_photos, :driver_photo, :vehicle_photo, :number_plate_photo, :email
             )
         """)
 
@@ -510,7 +529,11 @@ def register_driver():
             "google_maps_link": google_maps_link,
             "latitude": latitude,
             "longitude": longitude,
-            "vehicle_photos": data.get("vehicle_photos"),
+            "vehicle_photos": data.get("vehicle_photo") or data.get("vehicle_photos"),
+            "driver_photo": data.get("driver_photo"),
+            "vehicle_photo": data.get("vehicle_photo"),
+            "number_plate_photo": data.get("number_plate_photo"),
+            "email": data.get("email"),
         })
         db.session.commit()
 
@@ -961,13 +984,13 @@ def get_dashboard():
 
         return jsonify({
 
-            "locations": [dict(row) for row in locations],
+            "locations": _public_rows(locations, "locations"),
 
-            "homestays": [dict(row) for row in homestays],
+            "homestays": _public_rows(homestays, "homestays"),
 
             "eco": [dict(row) for row in eco],
 
-            "drivers": [dict(row) for row in drivers],
+            "drivers": _public_rows(drivers, "drivers"),
 
             "bus_stops": [dict(row) for row in bus_stops]
 
@@ -1042,7 +1065,12 @@ def register_location():
         longitude,
 
         photo_location,
-        site_photos
+        site_photos,
+
+        phone_number,
+        user_type,
+        is_crowded,
+        site_activity_details_doc
 
     )
     VALUES (
@@ -1090,7 +1118,12 @@ def register_location():
         :latitude,
         :longitude,
         :photo_location,
-        :site_photos
+        :site_photos,
+
+        :phone_number,
+        :user_type,
+        :is_crowded,
+        :site_activity_details_doc
 
     )
 """)
@@ -1149,8 +1182,14 @@ def register_location():
     
 
     # Photos
-    "photo_location": data.get("photo_location"),
-    "site_photos": data.get("site_photos")
+    "photo_location": data.get("header_photo") or data.get("photo_location"),
+    "site_photos": data.get("site_photos"),
+
+    # Submitter details (private - never returned by public endpoints)
+    "phone_number": data.get("phone_number"),
+    "user_type": data.get("user_type"),
+    "is_crowded": data.get("is_crowded"),
+    "site_activity_details_doc": data.get("site_activity_details_doc")
 
 })
 
@@ -1394,14 +1433,7 @@ def register_homestay():
         data = request.get_json()
 
         google_map_link = data.get("google_maps_link")
-
-        try:
-            latitude, longitude = extract_coordinates_from_google_maps(
-            google_map_link
-    )
-        except Exception:
-            latitude = None
-            longitude = None
+        latitude, longitude = _resolve_coordinates(data, google_map_link)
 
         query = text("""
             INSERT INTO pending_homestays (
@@ -1441,7 +1473,15 @@ def register_homestay():
                 amenities_photos,
                 google_map_link,
                 latitude,
-                longitude
+                longitude,
+
+                email,
+                homestay_location,
+                room_type,
+                price_range,
+                check_in_out_time,
+                activity_details_doc,
+                suggestions_improvements
 
             )
 
@@ -1482,7 +1522,15 @@ def register_homestay():
                 :amenities_photos,
                 :google_map_link,
                 :latitude,
-                :longitude
+                :longitude,
+
+                :email,
+                :homestay_location,
+                :room_type,
+                :price_range,
+                :check_in_out_time,
+                :activity_details_doc,
+                :suggestions_improvements
 
             )
         """)
@@ -1501,7 +1549,7 @@ def register_homestay():
             "unit_type": data.get("homestay_unit_type"),
             "homestay_type": data.get("homestay_type"),
             "discoverable_google_map": data.get("google_maps_discoverable"),
-            "photo_homestay": data.get("site_photos"),
+            "photo_homestay": data.get("header_photo"),
             "registered_mtdc": data.get("mtdc_registered"),
 
             "accept_bookings": data.get("booking_method"),
@@ -1521,10 +1569,18 @@ def register_homestay():
             "local_experiences": data.get("local_experiences"),
 
             "social_media_page": data.get("social_media_link"),
-            "amenities_photos": data.get("site_photos"),
+            "amenities_photos": data.get("site_photos"),  # gallery (comma-separated URLs)
             "google_map_link": data.get("google_maps_link"),
             "latitude": latitude,
-            "longitude": longitude
+            "longitude": longitude,
+
+            "email": data.get("email"),
+            "homestay_location": data.get("homestay_location"),
+            "room_type": data.get("room_type"),
+            "price_range": data.get("price_range"),
+            "check_in_out_time": data.get("check_in_out_time"),
+            "activity_details_doc": data.get("activity_details_doc"),
+            "suggestions_improvements": data.get("suggestions_improvements")
 
         })
         db.session.commit()
