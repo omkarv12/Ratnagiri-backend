@@ -1716,6 +1716,150 @@ def get_homestay_types():
         return jsonify({"error": str(e)}), 500
 
 
+# ==================================================================
+# Admin analytics (one call powers the whole analytics dashboard)
+# ==================================================================
+
+def _rows(sql, params=None):
+    """Run a query and return list[dict]; a failing query never breaks the rest."""
+    try:
+        res = db.session.execute(text(sql), params or {}).mappings().all()
+        return [dict(r) for r in res]
+    except Exception:
+        db.session.rollback()
+        return []
+
+
+def _scalar(sql, params=None):
+    try:
+        return db.session.execute(text(sql), params or {}).scalar() or 0
+    except Exception:
+        db.session.rollback()
+        return 0
+
+
+def _one(sql):
+    rows = _rows(sql)
+    return rows[0] if rows else {}
+
+
+@bp.route('/api/admin/analytics', methods=['GET'])
+def admin_analytics():
+    try:
+        totals = {
+            "locations": _scalar("SELECT COUNT(*) FROM locations"),
+            "homestays": _scalar("SELECT COUNT(*) FROM homestays"),
+            "drivers": _scalar("SELECT COUNT(*) FROM drivers"),
+            "bus_stops": _scalar("SELECT COUNT(*) FROM bus_stops"),
+            "eco_water": _scalar("SELECT COUNT(*) FROM eco_and_water"),
+            "village_profiles": _scalar("SELECT COUNT(*) FROM village_profiles"),
+            "stories_published": _scalar("SELECT COUNT(*) FROM blogs WHERE status = 'published'"),
+            "events_approved": _scalar("SELECT COUNT(*) FROM tourism_events WHERE status = 'approved'"),
+        }
+
+        pending = {
+            "locations": _scalar("SELECT COUNT(*) FROM pending_locations"),
+            "homestays": _scalar("SELECT COUNT(*) FROM pending_homestays"),
+            "drivers": _scalar("SELECT COUNT(*) FROM pending_drivers"),
+            "events": _scalar("SELECT COUNT(*) FROM tourism_events WHERE status = 'pending'"),
+        }
+
+        locations_by_taluka = _rows("""
+            SELECT COALESCE(NULLIF(taluka_name, ''), 'Unknown') AS label, COUNT(*) AS value
+            FROM locations GROUP BY 1 ORDER BY value DESC
+        """)
+        homestays_by_taluka = _rows("""
+            SELECT COALESCE(NULLIF(taluka_name, ''), 'Unknown') AS label, COUNT(*) AS value
+            FROM homestays GROUP BY 1 ORDER BY value DESC
+        """)
+        locations_by_type = _rows("""
+            SELECT COALESCE(NULLIF(attraction_type, ''), 'Other') AS label, COUNT(*) AS value
+            FROM locations GROUP BY 1 ORDER BY value DESC
+        """)
+        homestays_by_type = _rows("""
+            SELECT COALESCE(NULLIF(homestay_type, ''), 'Other') AS label, COUNT(*) AS value
+            FROM homestays GROUP BY 1 ORDER BY value DESC
+        """)
+        road_condition = _rows("""
+            SELECT COALESCE(NULLIF(road_condition::text, ''), 'Not stated') AS label, COUNT(*) AS value
+            FROM locations GROUP BY 1 ORDER BY value DESC
+        """)
+
+        location_readiness = _one("""
+            SELECT COUNT(*) AS total,
+                   COUNT(*) FILTER (
+                       WHERE COALESCE(site_photos::text, '') NOT IN ('', '{}', '[]')
+                   ) AS with_photos,
+                   COUNT(*) FILTER (
+                       WHERE latitude IS NOT NULL AND longitude IS NOT NULL
+                   ) AS with_coordinates,
+                   COUNT(*) FILTER (
+                       WHERE signboards_available::text ILIKE 'y%'
+                   ) AS with_signboards
+            FROM locations
+        """)
+
+        homestay_readiness = _one("""
+            SELECT COUNT(*) AS total,
+                   COUNT(*) FILTER (WHERE registered_mtdc::text ILIKE 'y%') AS mtdc_registered,
+                   COUNT(*) FILTER (
+                       WHERE digital_payments_upi::text ILIKE 'y%'
+                          OR digital_payments_upi::text ILIKE '%upi%'
+                   ) AS digital_payments,
+                   COUNT(*) FILTER (WHERE listed_booking_airbnb::text ILIKE 'y%') AS listed_online
+            FROM homestays
+        """)
+
+        events_by_month = _rows("""
+            SELECT to_char(g.m, 'Mon') AS label, COUNT(e.id) AS value
+            FROM generate_series(
+                date_trunc('month', CURRENT_DATE),
+                date_trunc('month', CURRENT_DATE) + interval '5 months',
+                interval '1 month'
+            ) AS g(m)
+            LEFT JOIN tourism_events e
+                   ON date_trunc('month', e.event_date) = g.m
+                  AND e.status = 'approved'
+            GROUP BY g.m ORDER BY g.m
+        """)
+        events_by_category = _rows("""
+            SELECT category AS label, COUNT(*) AS value
+            FROM tourism_events WHERE status = 'approved'
+            GROUP BY category ORDER BY value DESC
+        """)
+
+        stories = {
+            "published": totals["stories_published"],
+            "drafts": _scalar("SELECT COUNT(*) FROM blogs WHERE status <> 'published'"),
+            "total_views": _scalar("SELECT COALESCE(SUM(views), 0) FROM blogs WHERE status = 'published'"),
+            "comments": _scalar("SELECT COUNT(*) FROM blog_comments"),
+            "top": _rows("""
+                SELECT title AS label, COALESCE(views, 0) AS value
+                FROM blogs WHERE status = 'published'
+                ORDER BY views DESC NULLS LAST LIMIT 5
+            """),
+        }
+
+        return jsonify({
+            "totals": totals,
+            "pending": pending,
+            "locations_by_taluka": locations_by_taluka,
+            "homestays_by_taluka": homestays_by_taluka,
+            "locations_by_type": locations_by_type,
+            "homestays_by_type": homestays_by_type,
+            "road_condition": road_condition,
+            "location_readiness": location_readiness,
+            "homestay_readiness": homestay_readiness,
+            "events_by_month": events_by_month,
+            "events_by_category": events_by_category,
+            "stories": stories,
+        }), 200
+
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({"error": str(e)}), 500
+
+
 @bp.route('/api/upload-photo', methods=['POST'])
 def upload_photo():
     try:
