@@ -44,9 +44,13 @@ from app.drive_service import (
     get_image_bytes,
 )
 bp = Blueprint('main', __name__)
-from datetime import date
+
 EVENT_CATEGORIES = {"beaches", "forts", "temples", "waterfalls", "mangoes"}
 
+
+# ==================================================================
+# Events calendar (with photo support)
+# ==================================================================
 
 @bp.route('/api/events', methods=['GET'])
 def list_events():
@@ -62,7 +66,7 @@ def list_events():
     try:
         result = db.session.execute(text("""
             SELECT id, title, event_date::text AS event_date, category,
-                   organizer_name, description
+                   organizer_name, description, photo_url
             FROM tourism_events
             WHERE status = 'approved'
               AND event_date >= :start AND event_date < :end
@@ -84,7 +88,7 @@ def upcoming_events():
 
         result = db.session.execute(text("""
             SELECT id, title, event_date::text AS event_date, category,
-                   organizer_name, description
+                   organizer_name, description, photo_url
             FROM tourism_events
             WHERE status = 'approved' AND event_date >= CURRENT_DATE
             ORDER BY event_date, id
@@ -115,13 +119,17 @@ def contribute_event():
         except ValueError:
             return jsonify({"success": False, "error": "Invalid date"}), 400
 
+        photo_url = (data.get("photo_url") or "").strip() or None
+        if photo_url and not photo_url.startswith("https://"):
+            return jsonify({"success": False, "error": "Invalid photo URL"}), 400
+
         result = db.session.execute(text("""
             INSERT INTO tourism_events
                 (title, event_date, category, organizer_name,
-                 organizer_contact, organizer_email, description)
+                 organizer_contact, organizer_email, description, photo_url)
             VALUES
                 (:title, :event_date, :category, :organizer_name,
-                 :organizer_contact, :organizer_email, :description)
+                 :organizer_contact, :organizer_email, :description, :photo_url)
             RETURNING id
         """), {
             "title": title[:200],
@@ -131,6 +139,7 @@ def contribute_event():
             "organizer_contact": organizer_contact[:20],
             "organizer_email": (data.get("organizer_email") or "").strip()[:150] or None,
             "description": (data.get("description") or "").strip() or None,
+            "photo_url": photo_url,
         })
         new_id = result.scalar()
         db.session.commit()
@@ -152,7 +161,7 @@ def admin_list_events():
         result = db.session.execute(text("""
             SELECT id, title, event_date::text AS event_date, category,
                    organizer_name, organizer_contact, organizer_email,
-                   description, status, created_at
+                   description, photo_url, status, created_at
             FROM tourism_events
             WHERE (:status = 'all' OR status = :status)
             ORDER BY created_at DESC
@@ -191,6 +200,11 @@ def admin_reject_event(id):
     except Exception as e:
         db.session.rollback()
         return jsonify({"success": False, "error": str(e)}), 500
+
+
+# ==================================================================
+# Core routes
+# ==================================================================
 
 @bp.route('/', methods=['GET'])
 def index():
@@ -1717,4 +1731,4 @@ def upload_photo():
         }), 200
 
     except Exception as e:
-        return jsonify({"success": False, "error": str(e)}), 500   
+        return jsonify({"success": False, "error": str(e)}), 500
