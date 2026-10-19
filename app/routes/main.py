@@ -1932,3 +1932,98 @@ def upload_photo():
 
     except Exception as e:
         return jsonify({"success": False, "error": str(e)}), 500
+
+
+# ==================================================================
+# Medical facilities  (NEW)
+# Requires medical_facilities.sql to have been run on the database first.
+# ==================================================================
+
+@bp.route('/api/medical-facilities', methods=['GET'])
+def list_medical_facilities():
+    """
+    Optional query params:
+      category   hospital | clinic | diagnostic | pharmacy | blood_bank | ambulance
+      specialty  exact specialty text
+      lat, lng   visitor position; adds distance_km and sorts nearest first
+    """
+    try:
+        params = {
+            "category": request.args.get("category") or None,
+            "specialty": request.args.get("specialty") or None,
+            "lat": request.args.get("lat", type=float),
+            "lng": request.args.get("lng", type=float),
+        }
+
+        rows = db.session.execute(text("""
+            SELECT
+                f.id, f.slug, f.name, f.name_mr, f.category, f.specialty, f.ownership,
+                f.description, f.features,
+                f.address_line AS address, f.landmark, f.area, f.taluka, f.district,
+                f.state, f.pincode,
+                f.lat::float8 AS lat, f.lng::float8 AS lng, f.map_url,
+                f.phone_primary AS phone, f.phone_secondary, f.emergency_phone,
+                f.whatsapp, f.email, f.website,
+                f.opening_hours_note, f.is_24x7, f.emergency_available,
+                f.ambulance_available, f.icu_available, f.bed_count,
+                f.appointment_required, f.walk_in_allowed, f.teleconsultation,
+                f.home_service, f.wheelchair_accessible, f.hearing_loop,
+                f.parking_available, f.accepts_upi, f.accepts_cards,
+                f.cashless_insurance, f.govt_schemes, f.is_free,
+                f.consultation_fee_min::float8 AS consultation_fee_min,
+                f.consultation_fee_max::float8 AS consultation_fee_max,
+                f.languages, f.registration_no, f.accreditations, f.cover_image_url,
+                f.rating_avg::float8 AS rating_avg, f.rating_count,
+                f.is_verified, f.last_verified::text AS last_verified,
+
+                COALESCE((
+                    SELECT json_agg(json_build_object(
+                               'day', h.day_of_week,
+                               'opens', to_char(h.opens, 'HH24:MI'),
+                               'closes', to_char(h.closes, 'HH24:MI'),
+                               'is_24h', h.is_24h,
+                               'is_closed', h.is_closed)
+                           ORDER BY h.day_of_week, h.opens)
+                    FROM facility_hours h WHERE h.facility_id = f.id
+                ), '[]'::json) AS hours,
+
+                COALESCE((
+                    SELECT json_agg(json_build_object(
+                               'name', s.name, 'department', s.department, 'notes', s.notes)
+                           ORDER BY s.sort_order, s.name)
+                    FROM facility_services s WHERE s.facility_id = f.id
+                ), '[]'::json) AS services,
+
+                COALESCE((
+                    SELECT json_agg(json_build_object(
+                               'name', d.full_name, 'qualification', d.qualification,
+                               'specialization', d.specialization,
+                               'experience_years', d.experience_years,
+                               'available_days', d.available_days,
+                               'timing', d.timing_note,
+                               'fee', d.consultation_fee::float8)
+                           ORDER BY d.full_name)
+                    FROM facility_doctors d WHERE d.facility_id = f.id AND d.is_active
+                ), '[]'::json) AS doctors,
+
+                COALESCE((
+                    SELECT json_agg(json_build_object(
+                               'url', i.url, 'caption', i.caption, 'is_cover', i.is_cover)
+                           ORDER BY i.sort_order)
+                    FROM facility_images i WHERE i.facility_id = f.id
+                ), '[]'::json) AS images,
+
+                haversine_km(CAST(:lat AS float8), CAST(:lng AS float8),
+                             f.lat::float8, f.lng::float8) AS distance_km
+            FROM medical_facilities f
+            WHERE f.is_active
+              AND (CAST(:category AS text) IS NULL OR f.category = CAST(:category AS text))
+              AND (CAST(:specialty AS text) IS NULL OR f.specialty = CAST(:specialty AS text))
+            ORDER BY distance_km NULLS LAST, f.name
+        """), params).mappings().all()
+
+        return jsonify([dict(row) for row in rows]), 200
+
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({"error": str(e)}), 500
