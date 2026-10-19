@@ -2027,3 +2027,78 @@ def list_medical_facilities():
     except Exception as e:
         db.session.rollback()
         return jsonify({"error": str(e)}), 500
+
+    # ==================================================================
+# Police stations  (NEW)
+# Paste this at the bottom of routes.py, after list_medical_facilities.
+# Requires police_stations.sql to have been run on the database first.
+# ==================================================================
+
+@bp.route('/api/police-stations', methods=['GET'])
+def list_police_stations():
+    """
+    Optional query params:
+      category   station | district_office | cyber | headquarters |
+                 women_cell | traffic | outpost
+      lat, lng   visitor position; adds distance_km and sorts nearest first
+    """
+    try:
+        params = {
+            "category": request.args.get("category") or None,
+            "lat": request.args.get("lat", type=float),
+            "lng": request.args.get("lng", type=float),
+        }
+
+        rows = db.session.execute(text("""
+            SELECT
+                p.id, p.slug, p.name, p.name_mr, p.category, p.unit_type,
+                p.description, p.features, p.jurisdiction,
+                p.address_line AS address, p.landmark, p.area, p.taluka, p.district,
+                p.state, p.pincode,
+                p.lat::float8 AS lat, p.lng::float8 AS lng, p.map_url,
+                p.phone_primary AS phone, p.phone_secondary, p.emergency_phone,
+                p.whatsapp, p.email, p.website, p.online_complaint_url,
+                p.opening_hours_note, p.is_24x7, p.files_fir, p.online_complaints,
+                p.women_help_desk, p.tourist_help, p.lost_property_reports,
+                p.wheelchair_accessible, p.accessible_restrooms, p.parking_available,
+                p.languages, p.cover_image_url,
+                p.is_verified, p.last_verified::text AS last_verified,
+
+                COALESCE((
+                    SELECT json_agg(json_build_object(
+                               'day', h.day_of_week,
+                               'opens', to_char(h.opens, 'HH24:MI'),
+                               'closes', to_char(h.closes, 'HH24:MI'),
+                               'is_24h', h.is_24h,
+                               'is_closed', h.is_closed)
+                           ORDER BY h.day_of_week, h.opens)
+                    FROM police_station_hours h WHERE h.station_id = p.id
+                ), '[]'::json) AS hours,
+
+                COALESCE((
+                    SELECT json_agg(json_build_object(
+                               'name', s.name, 'notes', s.notes)
+                           ORDER BY s.sort_order, s.name)
+                    FROM police_station_services s WHERE s.station_id = p.id
+                ), '[]'::json) AS services,
+
+                COALESCE((
+                    SELECT json_agg(json_build_object(
+                               'url', i.url, 'caption', i.caption, 'is_cover', i.is_cover)
+                           ORDER BY i.sort_order)
+                    FROM police_station_images i WHERE i.station_id = p.id
+                ), '[]'::json) AS images,
+
+                haversine_km(CAST(:lat AS float8), CAST(:lng AS float8),
+                             p.lat::float8, p.lng::float8) AS distance_km
+            FROM police_stations p
+            WHERE p.is_active
+              AND (CAST(:category AS text) IS NULL OR p.category = CAST(:category AS text))
+            ORDER BY distance_km NULLS LAST, p.name
+        """), params).mappings().all()
+
+        return jsonify([dict(row) for row in rows]), 200
+
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({"error": str(e)}), 500
