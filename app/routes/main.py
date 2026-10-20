@@ -982,6 +982,11 @@ def get_dashboard():
             FROM bus_stops
         """)).mappings().all()
 
+        atms = db.session.execute(text("""
+            SELECT *
+            FROM atms
+        """)).mappings().all()
+
         return jsonify({
 
             "locations": _public_rows(locations, "locations"),
@@ -993,6 +998,8 @@ def get_dashboard():
             "drivers": _public_rows(drivers, "drivers"),
 
             "bus_stops": [dict(row) for row in bus_stops]
+            "atms": [dict(row) for row in atms]
+
 
         }), 200
 
@@ -2102,3 +2109,79 @@ def list_police_stations():
     except Exception as e:
         db.session.rollback()
         return jsonify({"error": str(e)}), 500
+
+@bp.route('/api/atms/register', methods=['POST'])
+def register_atm():
+    try:
+        data = request.get_json() or {}
+
+        atm_name = (data.get("atm_name") or "").strip()
+        bank_name = (data.get("bank_name") or "").strip()
+        if not atm_name or not bank_name:
+            return jsonify({"success": False, "error": "ATM name and bank are required."}), 400
+
+        google_maps_link = data.get("google_maps_link")
+        latitude, longitude = _resolve_coordinates(data, google_maps_link)
+        if latitude is None or longitude is None:
+            return jsonify({"success": False, "error": "Location coordinates are required."}), 400
+
+        photo_url = (data.get("photo_url") or "").strip() or None
+        if photo_url and not photo_url.startswith("https://"):
+            return jsonify({"success": False, "error": "Invalid photo URL"}), 400
+
+        db.session.execute(text("""
+            INSERT INTO atms (
+                atm_name, bank_name, village_name, taluka_name, district_name,
+                address, google_maps_link, latitude, longitude,
+                is_24x7, has_cash_deposit, photo_url
+            )
+            VALUES (
+                :atm_name, :bank_name, :village_name, :taluka_name, :district_name,
+                :address, :google_maps_link, :latitude, :longitude,
+                :is_24x7, :has_cash_deposit, :photo_url
+            )
+        """), {
+            "atm_name": atm_name[:200],
+            "bank_name": bank_name[:150],
+            "village_name": data.get("village_name"),
+            "taluka_name": data.get("taluka_name"),
+            "district_name": data.get("district_name", "Ratnagiri"),
+            "address": data.get("address"),
+            "google_maps_link": google_maps_link,
+            "latitude": latitude,
+            "longitude": longitude,
+            "is_24x7": bool(data.get("is_24x7", True)),
+            "has_cash_deposit": bool(data.get("has_cash_deposit", False)),
+            "photo_url": photo_url,
+        })
+        db.session.commit()
+
+        return jsonify({"success": True, "message": "ATM added successfully."}), 201
+
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@bp.route('/api/atms', methods=['GET'])
+def get_atms():
+    try:
+        result = db.session.execute(text("""
+            SELECT * FROM atms ORDER BY bank_name, atm_name
+        """)).mappings().all()
+        return jsonify([dict(row) for row in result]), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@bp.route('/api/atms/<int:id>', methods=['DELETE'])
+def delete_atm(id):
+    try:
+        result = db.session.execute(text("DELETE FROM atms WHERE id = :id"), {"id": id})
+        db.session.commit()
+        if result.rowcount == 0:
+            return jsonify({"success": False, "error": "ATM not found."}), 404
+        return jsonify({"success": True, "message": "ATM deleted."}), 200
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({"success": False, "error": str(e)}), 500
