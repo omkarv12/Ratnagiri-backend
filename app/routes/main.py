@@ -958,9 +958,9 @@ def get_dashboard():
     try:
 
         locations = db.session.execute(text("""
-    SELECT *
-    FROM locations
-""")).mappings().all()
+            SELECT *
+            FROM locations
+        """)).mappings().all()
 
         homestays = db.session.execute(text("""
             SELECT *
@@ -982,10 +982,9 @@ def get_dashboard():
             FROM bus_stops
         """)).mappings().all()
 
-        atms = db.session.execute(text("""
-            SELECT *
-            FROM atms
-        """)).mappings().all()
+        # _rows() returns [] if the atms table is missing or the query fails,
+        # so a problem with ATMs can never break the whole dashboard.
+        atms = _rows("SELECT * FROM atms ORDER BY bank_name, atm_name")
 
         return jsonify({
 
@@ -997,9 +996,9 @@ def get_dashboard():
 
             "drivers": _public_rows(drivers, "drivers"),
 
-            "bus_stops": [dict(row) for row in bus_stops]
-            "atms": [dict(row) for row in atms]
+            "bus_stops": [dict(row) for row in bus_stops],
 
+            "atms": [dict(row) for row in atms]
 
         }), 200
 
@@ -1788,7 +1787,8 @@ def _rows(sql, params=None):
     try:
         res = db.session.execute(text(sql), params or {}).mappings().all()
         return [dict(r) for r in res]
-    except Exception:
+    except Exception as e:
+        print("ROWS ERROR:", e)
         db.session.rollback()
         return []
 
@@ -2035,9 +2035,9 @@ def list_medical_facilities():
         db.session.rollback()
         return jsonify({"error": str(e)}), 500
 
-    # ==================================================================
+
+# ==================================================================
 # Police stations  (NEW)
-# Paste this at the bottom of routes.py, after list_medical_facilities.
 # Requires police_stations.sql to have been run on the database first.
 # ==================================================================
 
@@ -2109,6 +2109,12 @@ def list_police_stations():
     except Exception as e:
         db.session.rollback()
         return jsonify({"error": str(e)}), 500
+
+
+# ==================================================================
+# ATMs
+# Requires atms.sql to have been run on the database first.
+# ==================================================================
 
 @bp.route('/api/atms/register', methods=['POST'])
 def register_atm():
