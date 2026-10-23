@@ -2428,3 +2428,360 @@ def update_pending_location(id):
 @bp.route('/api/pending_homestays/<int:id>', methods=['PUT'])
 def update_pending_homestay(id):
     return admin_data_update("pending_homestays", id)
+
+
+# ---------------------------------------------------------------------------
+# HIDDEN PATHS — paste into main.py (uses your existing `db`, `bp`, `request`,
+# `jsonify`). Needs `import math` and `from datetime import datetime`.
+#
+# Photos are NOT handled here: the form uploads them through your existing
+# /api/upload-photo and sends the returned Cloudinary URLs.
+#
+# Admin routes use `admin_required`. Import/use whatever you already use to
+# protect the admin-only routes (Google sign-in check). Your pending_locations
+# routes should be protected the same way.
+# ---------------------------------------------------------------------------
+
+PATH_STATUSES = ('pending', 'needs_changes', 'approved', 'rejected')
+PATH_TYPES = ('Forest trail', 'Secret beach', 'Waterfall', 'Viewpoint', 'Village walk')
+PATH_DIFFICULTIES = ('Easy', 'Moderate', 'Hard')
+PATH_SPEED_KMH = {'Easy': 3.0, 'Moderate': 2.5, 'Hard': 2.0}
+# Rough box around Ratnagiri district; rejects points drawn elsewhere.
+PATH_BOUNDS = {'lat': (16.3, 18.3), 'lng': (72.8, 74.2)}
+
+
+class HiddenPath(db.Model):
+    __tablename__ = 'hidden_paths'
+
+    id = db.Column(db.Integer, primary_key=True)
+
+    # Public content
+    title = db.Column(db.String(200), nullable=False)
+    path_type = db.Column(db.String(40), nullable=False)
+    difficulty = db.Column(db.String(20), nullable=False)
+    taluka = db.Column(db.String(80))
+    village = db.Column(db.String(120))
+    length_km = db.Column(db.Float)
+    duration_min = db.Column(db.Integer)
+    best_season = db.Column(db.String(80))
+    avoid_season = db.Column(db.String(120))
+    open_in_monsoon = db.Column(db.Boolean, default=False)
+    how_to_reach = db.Column(db.Text)
+    safety_notes = db.Column(db.Text)
+    photos = db.Column(db.JSON, default=list)       # Cloudinary URLs, first = cover
+
+    # Route: [[lat, lng], ...], first = start, last = end
+    route = db.Column(db.JSON, default=list)
+    start_lat = db.Column(db.Float)
+    start_lng = db.Column(db.Float)
+
+    # Admin publishing options
+    hide_exact_coords = db.Column(db.Boolean, default=False)
+    verified_by_dept = db.Column(db.Boolean, default=False)
+    locals_pick = db.Column(db.Boolean, default=False)
+
+    # PRIVATE: never returned by public routes
+    submitter_role = db.Column(db.String(40))
+    submitter_name = db.Column(db.String(120))
+    submitter_phone = db.Column(db.String(30))
+    submitter_email = db.Column(db.String(120))
+    submitter_note = db.Column(db.Text)
+
+    # Review workflow
+    status = db.Column(db.String(20), nullable=False, default='pending', index=True)
+    admin_note = db.Column(db.Text)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    reviewed_at = db.Column(db.DateTime)
+
+
+# ---------------------------------------------------------------- helpers ----
+
+def _haversine_km(lat1, lng1, lat2, lng2):
+    r = 6371
+    d_lat = math.radians(lat2 - lat1)
+    d_lng = math.radians(lng2 - lng1)
+    a = (math.sin(d_lat / 2) ** 2
+         + math.cos(math.radians(lat1)) * math.cos(math.radians(lat2)) * math.sin(d_lng / 2) ** 2)
+    return r * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+
+
+def _route_length_km(route):
+    return round(sum(_haversine_km(a[0], a[1], b[0], b[1]) for a, b in zip(route, route[1:])), 1)
+
+
+def _walk_minutes(length_km, difficulty):
+    speed = PATH_SPEED_KMH.get(difficulty, 3.0)
+    return max(5, int(round(length_km / speed * 60 / 5.0)) * 5)
+
+
+def _clean(value, max_len):
+    return (value or '').strip()[:max_len]
+
+
+def _parse_route(raw):
+    """Returns a clean [[lat, lng], ...] list or None if invalid."""
+    if not isinstance(raw, list) or not (2 <= len(raw) <= 300):
+        return None
+    route = []
+    for pt in raw:
+        try:
+            lat, lng = float(pt[0]), float(pt[1])
+        except (TypeError, ValueError, IndexError, KeyError):
+            return None
+        if not (PATH_BOUNDS['lat'][0] <= lat <= PATH_BOUNDS['lat'][1]
+                and PATH_BOUNDS['lng'][0] <= lng <= PATH_BOUNDS['lng'][1]):
+            return None
+        route.append([round(lat, 6), round(lng, 6)])
+    return route
+
+
+def hidden_path_to_public(p, user_lat=None, user_lng=None):
+    """Public shape. No submitter details, ever. Coordinates only if allowed."""
+    show_coords = not p.hide_exact_coords and p.start_lat is not None
+
+    distance = None
+    if user_lat is not None and user_lng is not None and p.start_lat is not None:
+        # Computed here so hidden coordinates never leave the server.
+        distance = round(_haversine_km(user_lat, user_lng, p.start_lat, p.start_lng), 1)
+
+    return {
+        'id': p.id,
+        'title': p.title,
+        'path_type': p.path_type,
+        'difficulty': p.difficulty,
+        'taluka': p.taluka,
+        'village': p.village,
+        'length_km': p.length_km,
+        'duration_min': p.duration_min,
+        'best_season': p.best_season,
+        'avoid_season': p.avoid_season,
+        'open_in_monsoon': bool(p.open_in_monsoon),
+        'how_to_reach': p.how_to_reach,
+        'safety_notes': p.safety_notes,
+        'cover_photo': (p.photos or [None])[0],
+        'photos': p.photos or [],
+        'verified_by_dept': bool(p.verified_by_dept),
+        'locals_pick': bool(p.locals_pick),
+        'start_lat': p.start_lat if show_coords else None,
+        'start_lng': p.start_lng if show_coords else None,
+        'route': (p.route or []) if show_coords else [],
+        'distance_km': distance,
+    }
+
+
+def hidden_path_to_admin(p):
+    """Everything, including private submitter details and the true route."""
+    d = hidden_path_to_public(p)
+    d.update({
+        'start_lat': p.start_lat,
+        'start_lng': p.start_lng,
+        'route': p.route or [],
+        'hide_exact_coords': bool(p.hide_exact_coords),
+        'submitter_role': p.submitter_role,
+        'submitter_name': p.submitter_name,
+        'submitter_phone': p.submitter_phone,
+        'submitter_email': p.submitter_email,
+        'submitter_note': p.submitter_note,
+        'status': p.status,
+        'admin_note': p.admin_note,
+        'created_at': p.created_at.isoformat() if p.created_at else None,
+        'reviewed_at': p.reviewed_at.isoformat() if p.reviewed_at else None,
+    })
+    return d
+
+
+# ---------------------------------------------------------- public routes ----
+
+@bp.route('/api/hidden-paths', methods=['GET'])
+def list_hidden_paths():
+    """Approved paths only, newest first. Optional ?lat=&lng= adds distance_km."""
+    user_lat = request.args.get('lat', type=float)
+    user_lng = request.args.get('lng', type=float)
+    paths = (HiddenPath.query.filter_by(status='approved')
+             .order_by(HiddenPath.created_at.desc()).all())
+    return jsonify({
+        'success': True,
+        'paths': [hidden_path_to_public(p, user_lat, user_lng) for p in paths],
+    })
+
+
+@bp.route('/api/hidden-paths/<int:path_id>', methods=['GET'])
+def get_hidden_path(path_id):
+    p = HiddenPath.query.filter_by(id=path_id, status='approved').first()
+    if not p:
+        return jsonify({'success': False, 'error': 'Path not found.'}), 404
+    return jsonify({'success': True, 'path': hidden_path_to_public(p)})
+
+
+@bp.route('/api/hidden-paths/register', methods=['POST'])
+def register_hidden_path():
+    """Public submission. Always saved as 'pending'; nothing is published until an admin approves."""
+    data = request.get_json(silent=True) or {}
+
+    # Honeypot: real users never fill this hidden field.
+    if data.get('website'):
+        return jsonify({'success': True, 'message': 'Thank you! Your path was submitted for review.'})
+
+    errors = []
+    title = _clean(data.get('title'), 200)
+    path_type = data.get('path_type')
+    difficulty = data.get('difficulty')
+    safety_notes = _clean(data.get('safety_notes'), 2000)
+    name = _clean(data.get('submitter_name'), 120)
+    phone = _clean(data.get('phone_number'), 30)
+    email = _clean(data.get('email_address'), 120)
+    route = _parse_route(data.get('route'))
+    photos = data.get('photos')
+
+    if not title:
+        errors.append('Path title is required.')
+    if path_type not in PATH_TYPES:
+        errors.append('Choose a valid path type.')
+    if difficulty not in PATH_DIFFICULTIES:
+        errors.append('Choose a valid difficulty.')
+    if not safety_notes:
+        errors.append('Safety notes are required.')
+    if not name:
+        errors.append('Your name is required.')
+    if not phone and not email:
+        errors.append('Give a phone number or an email.')
+    if route is None:
+        errors.append('Draw the path on the map inside Ratnagiri district (start and end point needed).')
+    if data.get('consent_public_land') is not True:
+        errors.append('Please confirm the path is on public land or you have the owner\'s permission.')
+    if (not isinstance(photos, list) or not (1 <= len(photos) <= 3)
+            or not all(isinstance(u, str) and u.startswith('http') for u in photos)):
+        errors.append('Add 1 to 3 photos.')
+
+    if errors:
+        return jsonify({'success': False, 'error': ' '.join(errors)}), 400
+
+    length_km = _route_length_km(route)
+
+    p = HiddenPath(
+        title=title,
+        path_type=path_type,
+        difficulty=difficulty,
+        taluka=_clean(data.get('taluka_name'), 80),
+        village=_clean(data.get('village_name'), 120),
+        length_km=length_km,
+        duration_min=_walk_minutes(length_km, difficulty),
+        best_season=_clean(data.get('best_season'), 80),
+        avoid_season=_clean(data.get('avoid_season'), 120),
+        open_in_monsoon=bool(data.get('open_in_monsoon')),
+        how_to_reach=_clean(data.get('how_to_reach'), 2000),
+        safety_notes=safety_notes,
+        photos=photos,
+        route=route,
+        start_lat=route[0][0],
+        start_lng=route[0][1],
+        # "Sensitive place" ticked by the submitter -> start hidden; admin can change it.
+        hide_exact_coords=bool(data.get('sensitive')),
+        submitter_role=_clean(data.get('user_type'), 40),
+        submitter_name=name,
+        submitter_phone=phone,
+        submitter_email=email,
+        submitter_note=_clean(data.get('submitter_note'), 2000),
+        status='pending',
+    )
+    db.session.add(p)
+    db.session.commit()
+
+    return jsonify({
+        'success': True,
+        'message': 'Thank you! Your path was submitted. The tourism department will review it before it is published.',
+    }), 201
+
+
+# ----------------------------------------------------------- admin routes ----
+
+@bp.route('/api/admin/hidden-paths', methods=['GET'])
+@admin_required
+def admin_list_hidden_paths():
+    status = request.args.get('status', 'pending')
+    q = HiddenPath.query
+    if status in PATH_STATUSES:
+        q = q.filter_by(status=status)
+    items = q.order_by(HiddenPath.created_at.desc()).all()
+    counts = {s: HiddenPath.query.filter_by(status=s).count() for s in PATH_STATUSES}
+    return jsonify({'success': True, 'paths': [hidden_path_to_admin(p) for p in items], 'counts': counts})
+
+
+@bp.route('/api/admin/hidden-paths/<int:path_id>/review', methods=['POST'])
+@admin_required
+def admin_review_hidden_path(path_id):
+    p = HiddenPath.query.get_or_404(path_id)
+    data = request.get_json(silent=True) or {}
+
+    action = data.get('action')
+    status_for = {'approve': 'approved', 'request_changes': 'needs_changes', 'reject': 'rejected'}
+    if action not in status_for:
+        return jsonify({'success': False, 'error': 'Unknown action.'}), 400
+
+    note = _clean(data.get('note'), 2000)
+    if action != 'approve' and not note:
+        return jsonify({'success': False, 'error': 'A note to the submitter is required.'}), 400
+    if action == 'approve' and data.get('checklist_complete') is not True:
+        return jsonify({'success': False, 'error': 'Complete the review checklist before approving.'}), 400
+
+    p.verified_by_dept = bool(data.get('verified_by_dept'))
+    p.locals_pick = bool(data.get('locals_pick'))
+    p.hide_exact_coords = bool(data.get('hide_exact_coords'))
+    p.status = status_for[action]
+    p.admin_note = note
+    p.reviewed_at = datetime.utcnow()
+    db.session.commit()
+
+    # TODO: if you have email set up, send `note` to p.submitter_email here
+    # (needed for "Request changes" and "Reject" to reach the submitter).
+
+    messages = {
+        'approve': 'Path approved and published.',
+        'request_changes': 'Changes requested.',
+        'reject': 'Path rejected.',
+    }
+    return jsonify({'success': True, 'message': messages[action], 'path': hidden_path_to_admin(p)})
+
+
+@bp.route('/api/admin/hidden-paths/<int:path_id>', methods=['PUT'])
+@admin_required
+def admin_update_hidden_path(path_id):
+    """Edit the public text of any path (pending or already published)."""
+    p = HiddenPath.query.get_or_404(path_id)
+    data = request.get_json(silent=True) or {}
+
+    if 'path_type' in data:
+        if data['path_type'] not in PATH_TYPES:
+            return jsonify({'success': False, 'error': 'Invalid path type.'}), 400
+        p.path_type = data['path_type']
+    if 'difficulty' in data:
+        if data['difficulty'] not in PATH_DIFFICULTIES:
+            return jsonify({'success': False, 'error': 'Invalid difficulty.'}), 400
+        p.difficulty = data['difficulty']
+        if p.length_km:
+            p.duration_min = _walk_minutes(p.length_km, p.difficulty)
+
+    text_limits = {
+        'title': 200, 'taluka': 80, 'village': 120, 'best_season': 80,
+        'avoid_season': 120, 'how_to_reach': 2000, 'safety_notes': 2000,
+    }
+    for field, limit in text_limits.items():
+        if field in data:
+            value = _clean(data[field], limit)
+            if field in ('title', 'safety_notes') and not value:
+                return jsonify({'success': False, 'error': f'{field} cannot be empty.'}), 400
+            setattr(p, field, value)
+    if 'open_in_monsoon' in data:
+        p.open_in_monsoon = bool(data['open_in_monsoon'])
+
+    db.session.commit()
+    return jsonify({'success': True, 'path': hidden_path_to_admin(p)})
+
+
+@bp.route('/api/admin/hidden-paths/<int:path_id>', methods=['DELETE'])
+@admin_required
+def admin_delete_hidden_path(path_id):
+    p = HiddenPath.query.get_or_404(path_id)
+    db.session.delete(p)
+    db.session.commit()
+    return jsonify({'success': True, 'message': 'Path deleted.'})
