@@ -228,7 +228,7 @@ def admin_reject_event(id):
 
 # ==================================================================
 # Core routes
-# ==================================================================
+
 
 @bp.route('/', methods=['GET'])
 def index():
@@ -240,7 +240,7 @@ def index():
 @bp.route('/api/youtube-videos', methods=['GET'])
 def get_youtube_videos():
     try:
-        playlist_id = os.environ.get('YOUTUBE_PLAYLIST_ID')
+        playlist_id = os.environ.get('YOUTUBE_PLAYLIST_ID')  
         api_key = os.environ.get('YOUTUBE_API_KEY')
 
         if not playlist_id or not api_key:
