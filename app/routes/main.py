@@ -2191,3 +2191,240 @@ def delete_atm(id):
     except Exception as e:
         db.session.rollback()
         return jsonify({"success": False, "error": str(e)}), 500
+
+
+# ==================================================================
+# Admin data manager: view / edit / delete / add live records
+#
+# PASTE THIS AT THE END OF YOUR ROUTES FILE (the one that defines `bp`,
+# `_rows` and `_resolve_coordinates`). It needs no new imports beyond the
+# ones that file already has (json, text, db, request, jsonify).
+#
+# Table names come from the fixed ADMIN_TABLES list and column names are
+# checked against the real table columns, so nothing from the request is
+# ever put into the SQL text.
+# ==================================================================
+
+ADMIN_TABLES = {
+    "locations": "locations",
+    "homestays": "homestays",
+    "drivers": "drivers",
+    "bus_stops": "bus_stops",
+    "atms": "atms",
+    "pending_locations": "pending_locations",
+    "pending_homestays": "pending_homestays",
+}
+
+# Kinds that can be created from the admin panel, with their required fields.
+ADMIN_CREATABLE = {
+    "bus_stops": ("stop_name",),
+    "atms": ("atm_name", "bank_name"),
+}
+
+_ADMIN_READONLY_COLUMNS = {
+    "id", "created_at", "updated_at", "submitted_at", "reviewed_at",
+    "reviewed_by", "approved_at",
+}
+_ADMIN_TIME_TYPES = {
+    "timestamp without time zone", "timestamp with time zone", "date",
+    "time without time zone", "time with time zone",
+}
+_ADMIN_NUMERIC_TYPES = {
+    "integer", "bigint", "smallint", "numeric", "double precision", "real",
+}
+
+
+def _admin_table_columns(table):
+    rows = db.session.execute(text("""
+        SELECT column_name, data_type
+        FROM information_schema.columns
+        WHERE table_schema = current_schema() AND table_name = :t
+        ORDER BY ordinal_position
+    """), {"t": table}).all()
+    return {r[0]: r[1] for r in rows}
+
+
+def _admin_coerce(value, data_type):
+    """Turn a value from the admin form into something the column accepts."""
+    if data_type == "ARRAY":
+        if isinstance(value, list):
+            return value
+        if value in (None, ""):
+            return None
+        return [p.strip() for p in str(value).split(",") if p.strip()]
+    if data_type == "boolean":
+        if isinstance(value, bool) or value is None:
+            return value
+        s = str(value).strip().lower()
+        if s == "":
+            return None
+        return s in ("true", "t", "1", "yes", "y")
+    if data_type in ("json", "jsonb"):
+        if value in (None, ""):
+            return None
+        return value if isinstance(value, str) else json.dumps(value)
+    if data_type in _ADMIN_NUMERIC_TYPES:
+        return None if value in (None, "") else value
+    return value
+
+
+def _admin_check_coordinates(data):
+    """Return an error message if latitude / longitude are present but invalid."""
+    for key, low, high in (("latitude", -90, 90), ("longitude", -180, 180)):
+        value = data.get(key)
+        if value in (None, ""):
+            continue
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            return f"{key.capitalize()} must be a number."
+        if not (low <= number <= high):
+            return f"{key.capitalize()} is out of range."
+    return None
+
+
+def _admin_editable(cols, key):
+    return (
+        key in cols
+        and key not in _ADMIN_READONLY_COLUMNS
+        and cols[key] not in _ADMIN_TIME_TYPES
+    )
+
+
+@bp.route('/api/admin/data/<kind>', methods=['GET'])
+def admin_data_list(kind):
+    table = ADMIN_TABLES.get(kind)
+    if not table:
+        return jsonify({"error": "Unknown data type."}), 404
+    try:
+        rows = db.session.execute(
+            text(f"SELECT * FROM {table} ORDER BY id DESC")
+        ).mappings().all()
+        return jsonify([dict(r) for r in rows]), 200
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({"error": str(e)}), 500
+
+
+@bp.route('/api/admin/data/<kind>/<int:id>', methods=['PUT'])
+def admin_data_update(kind, id):
+    table = ADMIN_TABLES.get(kind)
+    if not table:
+        return jsonify({"error": "Unknown data type."}), 404
+    try:
+        data = request.get_json(silent=True) or {}
+
+        problem = _admin_check_coordinates(data)
+        if problem:
+            return jsonify({"success": False, "error": problem}), 400
+
+        cols = _admin_table_columns(table)
+        sets, params = [], {"id": id}
+        for i, (key, value) in enumerate(data.items()):
+            if not _admin_editable(cols, key):
+                continue
+            sets.append(f'"{key}" = :p{i}')
+            params[f"p{i}"] = _admin_coerce(value, cols[key])
+
+        if not sets:
+            return jsonify({"success": False, "error": "Nothing to update."}), 400
+
+        row = db.session.execute(
+            text(f"UPDATE {table} SET {', '.join(sets)} WHERE id = :id RETURNING *"),
+            params,
+        ).mappings().first()
+
+        if row is None:
+            db.session.rollback()
+            return jsonify({"success": False, "error": "Record not found."}), 404
+
+        db.session.commit()
+        return jsonify(dict(row)), 200
+
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@bp.route('/api/admin/data/<kind>/<int:id>', methods=['DELETE'])
+def admin_data_delete(kind, id):
+    table = ADMIN_TABLES.get(kind)
+    if not table:
+        return jsonify({"error": "Unknown data type."}), 404
+    try:
+        result = db.session.execute(text(f"DELETE FROM {table} WHERE id = :id"), {"id": id})
+        db.session.commit()
+        if result.rowcount == 0:
+            return jsonify({"success": False, "error": "Record not found."}), 404
+        return jsonify({"success": True, "message": "Deleted."}), 200
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@bp.route('/api/admin/data/<kind>', methods=['POST'])
+def admin_data_create(kind):
+    table = ADMIN_TABLES.get(kind)
+    required = ADMIN_CREATABLE.get(kind)
+    if not table or required is None:
+        return jsonify({"success": False, "error": "This type can't be added here."}), 400
+    try:
+        data = request.get_json(silent=True) or {}
+
+        for field in required:
+            if not str(data.get(field) or "").strip():
+                return jsonify({"success": False, "error": f"{field.replace('_', ' ').capitalize()} is required."}), 400
+
+        problem = _admin_check_coordinates(data)
+        if problem:
+            return jsonify({"success": False, "error": problem}), 400
+
+        latitude, longitude = _resolve_coordinates(data, data.get("google_maps_link"))
+        if latitude in (None, "") or longitude in (None, ""):
+            return jsonify({"success": False, "error": "Location coordinates are required."}), 400
+        data["latitude"], data["longitude"] = latitude, longitude
+
+        data.setdefault("district_name", "Ratnagiri")
+        if kind == "atms":
+            data.setdefault("is_24x7", True)
+            data.setdefault("has_cash_deposit", False)
+            photo = (data.get("photo_url") or "").strip()
+            if photo and not photo.startswith("https://"):
+                return jsonify({"success": False, "error": "Photo URL must start with https://"}), 400
+
+        cols = _admin_table_columns(table)
+        column_parts, value_parts, params = [], [], {}
+        for i, (key, value) in enumerate(data.items()):
+            if not _admin_editable(cols, key):
+                continue
+            column_parts.append(f'"{key}"')
+            value_parts.append(f":p{i}")
+            params[f"p{i}"] = _admin_coerce(value, cols[key])
+
+        columns_sql = ", ".join(column_parts)
+        placeholders = ", ".join(value_parts)
+
+        row = db.session.execute(
+            text(f"INSERT INTO {table} ({columns_sql}) VALUES ({placeholders}) RETURNING *"),
+            params,
+        ).mappings().first()
+        db.session.commit()
+
+        return jsonify(dict(row)), 201
+
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+# The Pending Submissions tab already calls these to save an edit, but the
+# routes did not exist. They reuse the same updater and return the updated row.
+
+@bp.route('/api/pending_locations/<int:id>', methods=['PUT'])
+def update_pending_location(id):
+    return admin_data_update("pending_locations", id)
+
+
+@bp.route('/api/pending_homestays/<int:id>', methods=['PUT'])
+def update_pending_homestay(id):
+    return admin_data_update("pending_homestays", id)
