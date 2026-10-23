@@ -2814,3 +2814,182 @@ def admin_delete_hidden_path(path_id):
     db.session.delete(p)
     db.session.commit()
     return jsonify({'success': True, 'message': 'Path deleted.'})
+
+
+# ==================================================================
+# Local Experiences (Guided Walks / Konkani Food / Community Interaction)
+# Requires experiences.sql to have been run on the database first.
+#
+# PASTE THIS AT THE VERY END of your routes file (the one that defines `bp`).
+# It needs no new imports: it uses json, text, db, request, jsonify and
+# unique_slug(), which that file already has.
+# Photos are uploaded through your existing POST /api/upload-photo (Cloudinary).
+# ==================================================================
+
+EXPERIENCE_CATEGORIES = {"guided-walks", "konkani-food", "community-interaction"}
+_EXP_TEXT_FIELDS = (
+    "title", "summary", "description", "image_url",
+    "location", "duration", "price", "season", "contact",
+)
+_EXP_SELECT = """
+    SELECT id, category, title, slug, summary, description, image_url,
+           location, duration, price, season, highlights, contact,
+           display_order, status, updated_at::text AS updated_at
+    FROM experiences
+"""
+
+
+def _exp_values(data):
+    """Clean the request body into the values the table accepts."""
+    values = {f: (data.get(f) or "").strip() for f in _EXP_TEXT_FIELDS}
+
+    highlights = data.get("highlights") or []
+    if isinstance(highlights, str):
+        highlights = highlights.split("\n")
+    values["highlights"] = json.dumps(
+        [str(h).strip() for h in highlights if str(h).strip()]
+    )
+
+    try:
+        values["display_order"] = int(data.get("display_order") or 0)
+    except (TypeError, ValueError):
+        values["display_order"] = 0
+
+    status = data.get("status")
+    values["status"] = status if status in ("published", "draft") else "published"
+    return values
+
+
+def _exp_image_problem(values):
+    url = values["image_url"]
+    if url and not url.startswith("https://"):
+        return "Photo URL must start with https://"
+    return None
+
+
+# ---------------- Public ----------------
+
+@bp.route('/api/experiences', methods=['GET'])
+def list_experiences():
+    """/api/experiences?category=guided-walks  (published only)"""
+    category = request.args.get("category", "")
+    if category not in EXPERIENCE_CATEGORIES:
+        return jsonify({"error": "Unknown category."}), 400
+    try:
+        rows = db.session.execute(text(_EXP_SELECT + """
+            WHERE category = :category AND status = 'published'
+            ORDER BY display_order, id
+        """), {"category": category}).mappings().all()
+        return jsonify([dict(r) for r in rows]), 200
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({"error": str(e)}), 500
+
+
+# ---------------- Admin ----------------
+
+@bp.route('/api/admin/experiences', methods=['GET'])
+def admin_list_experiences():
+    """/api/admin/experiences?category=guided-walks  (includes drafts)"""
+    category = request.args.get("category", "")
+    if category not in EXPERIENCE_CATEGORIES:
+        return jsonify({"error": "Unknown category."}), 400
+    try:
+        rows = db.session.execute(text(_EXP_SELECT + """
+            WHERE category = :category
+            ORDER BY display_order, id
+        """), {"category": category}).mappings().all()
+        return jsonify([dict(r) for r in rows]), 200
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({"error": str(e)}), 500
+
+
+@bp.route('/api/admin/experiences', methods=['POST'])
+def admin_create_experience():
+    try:
+        data = request.get_json(silent=True) or {}
+
+        category = data.get("category")
+        if category not in EXPERIENCE_CATEGORIES:
+            return jsonify({"success": False, "error": "Unknown category."}), 400
+
+        values = _exp_values(data)
+        if not values["title"]:
+            return jsonify({"success": False, "error": "Title is required."}), 400
+        problem = _exp_image_problem(values)
+        if problem:
+            return jsonify({"success": False, "error": problem}), 400
+
+        values["category"] = category
+        values["slug"] = unique_slug(values["title"], "experiences")
+
+        row = db.session.execute(text("""
+            INSERT INTO experiences (
+                category, title, slug, summary, description, image_url,
+                location, duration, price, season, highlights, contact,
+                display_order, status
+            ) VALUES (
+                :category, :title, :slug, :summary, :description, :image_url,
+                :location, :duration, :price, :season,
+                CAST(:highlights AS jsonb), :contact,
+                :display_order, :status
+            )
+            RETURNING id
+        """), values).first()
+        db.session.commit()
+
+        return jsonify({"success": True, "id": row[0], "slug": values["slug"]}), 201
+
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@bp.route('/api/admin/experiences/<int:id>', methods=['PUT'])
+def admin_update_experience(id):
+    try:
+        data = request.get_json(silent=True) or {}
+
+        values = _exp_values(data)
+        if not values["title"]:
+            return jsonify({"success": False, "error": "Title is required."}), 400
+        problem = _exp_image_problem(values)
+        if problem:
+            return jsonify({"success": False, "error": problem}), 400
+
+        values["id"] = id
+        result = db.session.execute(text("""
+            UPDATE experiences SET
+                title = :title, summary = :summary, description = :description,
+                image_url = :image_url, location = :location, duration = :duration,
+                price = :price, season = :season,
+                highlights = CAST(:highlights AS jsonb), contact = :contact,
+                display_order = :display_order, status = :status,
+                updated_at = NOW()
+            WHERE id = :id
+        """), values)
+        db.session.commit()
+
+        if result.rowcount == 0:
+            return jsonify({"success": False, "error": "Not found."}), 404
+        return jsonify({"success": True}), 200
+
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@bp.route('/api/admin/experiences/<int:id>', methods=['DELETE'])
+def admin_delete_experience(id):
+    try:
+        result = db.session.execute(
+            text("DELETE FROM experiences WHERE id = :id"), {"id": id}
+        )
+        db.session.commit()
+        if result.rowcount == 0:
+            return jsonify({"success": False, "error": "Not found."}), 404
+        return jsonify({"success": True}), 200
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({"success": False, "error": str(e)}), 500
