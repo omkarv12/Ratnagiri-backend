@@ -4,7 +4,9 @@ from flask import Blueprint, jsonify, request, send_file
 from sqlalchemy import text
 from app import db
 import json
-from datetime import date
+import math
+from datetime import date, datetime
+from functools import wraps
 from google.oauth2 import id_token
 from google.auth.transport import requests as grequests
 
@@ -44,6 +46,17 @@ from app.drive_service import (
     get_image_bytes,
 )
 bp = Blueprint('main', __name__)
+
+
+def admin_required(f):
+    """Placeholder. Your other admin routes (events, pending_locations, blogs...)
+    also have no server-side check, so this behaves the same way for now.
+    TODO: put the real admin check here."""
+    @wraps(f)
+    def wrapper(*args, **kwargs):
+        # TODO: real admin check
+        return f(*args, **kwargs)
+    return wrapper
 
 
 def _resolve_coordinates(data, maps_link):
@@ -2431,15 +2444,14 @@ def update_pending_homestay(id):
 
 
 # ---------------------------------------------------------------------------
-# HIDDEN PATHS — paste into main.py (uses your existing `db`, `bp`, `request`,
-# `jsonify`). Needs `import math` and `from datetime import datetime`.
+# HIDDEN PATHS
 #
 # Photos are NOT handled here: the form uploads them through your existing
 # /api/upload-photo and sends the returned Cloudinary URLs.
 #
-# Admin routes use `admin_required`. Import/use whatever you already use to
-# protect the admin-only routes (Google sign-in check). Your pending_locations
-# routes should be protected the same way.
+# Admin routes use `admin_required` (defined near the top of this file).
+# It is a placeholder for now: replace it with a real admin check, and protect
+# your pending_locations / events admin routes the same way.
 # ---------------------------------------------------------------------------
 
 PATH_STATUSES = ('pending', 'needs_changes', 'approved', 'rejected')
@@ -2492,6 +2504,23 @@ class HiddenPath(db.Model):
     admin_note = db.Column(db.Text)
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
     reviewed_at = db.Column(db.DateTime)
+
+
+# Creates the hidden_paths table on the first request if it does not exist yet,
+# so no separate migration is needed.
+_hidden_paths_ready = False
+
+
+@bp.before_app_request
+def _ensure_hidden_paths_table():
+    global _hidden_paths_ready
+    if _hidden_paths_ready:
+        return
+    _hidden_paths_ready = True
+    try:
+        HiddenPath.__table__.create(bind=db.engine, checkfirst=True)
+    except Exception as e:
+        print("HIDDEN PATHS TABLE ERROR:", e)
 
 
 # ---------------------------------------------------------------- helpers ----
