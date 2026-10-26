@@ -2993,3 +2993,344 @@ def admin_delete_experience(id):
     except Exception as e:
         db.session.rollback()
         return jsonify({"success": False, "error": str(e)}), 500
+
+# ==================================================================
+# Explore Villages
+# Requires explore_villages.sql to have been run on the database first.
+#
+# PASTE THIS AT THE VERY END of your routes file (the one that defines `bp`).
+# It needs no new imports: it uses json, text, db, request, jsonify,
+# _rows, _clean, _public_rows and admin_required, which that file already has.
+# Photos are uploaded through your existing POST /api/upload-photo (Cloudinary).
+# ==================================================================
+
+_VX_ITEM_SECTIONS = ("food", "flowers", "birds", "festivals")
+
+
+def _vx_https(url, max_len=500):
+    url = _clean(url, max_len)
+    return url if url.startswith("https://") else ""
+
+
+def _vx_items(raw, limit=30):
+    """[{name, description, season, image_url}] with empty names dropped."""
+    items = []
+    for it in (raw if isinstance(raw, list) else [])[:limit]:
+        if not isinstance(it, dict):
+            continue
+        name = _clean(it.get("name"), 150)
+        if not name:
+            continue
+        items.append({
+            "name": name,
+            "description": _clean(it.get("description"), 800),
+            "season": _clean(it.get("season"), 80),
+            "image_url": _vx_https(it.get("image_url")),
+        })
+    return items
+
+
+def _vx_timeline(raw, limit=30):
+    rows = []
+    for it in (raw if isinstance(raw, list) else [])[:limit]:
+        if not isinstance(it, dict):
+            continue
+        text_value = _clean(it.get("text"), 500)
+        if text_value:
+            rows.append({"year": _clean(it.get("year"), 60), "text": text_value})
+    return rows
+
+
+def _vx_values(data):
+    """Returns (values, error). Values are ready to bind to the SQL below."""
+    taluka = _clean(data.get("taluka_name"), 80)
+    village = _clean(data.get("village_name"), 120)
+    if not taluka or not village:
+        return None, "Taluka and village are required."
+
+    hero = _clean(data.get("hero_image"), 500)
+    if hero and not hero.startswith("https://"):
+        return None, "Hero image URL must start with https://"
+
+    gallery = [u for u in (_vx_https(g) for g in (data.get("gallery") or [])[:12]) if u]
+    status = data.get("status")
+
+    return {
+        "taluka_name": taluka,
+        "village_name": village,
+        "tagline": _clean(data.get("tagline"), 200),
+        "hero_image": hero,
+        "intro": _clean(data.get("intro"), 3000),
+        "history": _clean(data.get("history"), 8000),
+        "how_to_reach": _clean(data.get("how_to_reach"), 1500),
+        "best_time": _clean(data.get("best_time"), 200),
+        "status": status if status in ("published", "draft") else "published",
+        "history_timeline": json.dumps(_vx_timeline(data.get("history_timeline"))),
+        "food": json.dumps(_vx_items(data.get("food"))),
+        "flowers": json.dumps(_vx_items(data.get("flowers"))),
+        "birds": json.dumps(_vx_items(data.get("birds"))),
+        "festivals": json.dumps(_vx_items(data.get("festivals"))),
+        "gallery": json.dumps(gallery),
+    }, None
+
+
+# Matches a village in the existing tables, ignoring case and stray spaces.
+_VX_PLACES_COUNT = """(SELECT COUNT(*) FROM locations l
+                       WHERE lower(trim(l.village_name)) = lower(trim(v.village_name))
+                         AND lower(trim(l.taluka_name)) = lower(trim(v.taluka_name)))"""
+_VX_STAYS_COUNT = """(SELECT COUNT(*) FROM homestays h
+                      WHERE lower(trim(h.village_town_city)) = lower(trim(v.village_name))
+                        AND lower(trim(h.taluka_name)) = lower(trim(v.taluka_name)))"""
+
+
+VX_BUS_RADIUS_KM = 15   # bus stops within this distance of the village are listed
+VX_BUS_LIMIT = 6
+
+
+def _vx_float(value):
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _vx_center(*groups):
+    """Average lat/lng of the first group that has coordinates (places, then stays, then ATMs)."""
+    for rows in groups:
+        pts = [(_vx_float(r.get("latitude")), _vx_float(r.get("longitude"))) for r in rows]
+        pts = [p for p in pts if p[0] is not None and p[1] is not None]
+        if pts:
+            return sum(p[0] for p in pts) / len(pts), sum(p[1] for p in pts) / len(pts)
+    return None
+
+
+def _vx_bus_stops(taluka, village, center):
+    """Stops named after the village (same taluka) plus stops near its places, nearest first."""
+    stops = _rows("""
+        SELECT id, stop_name, taluka_name, google_maps_link, timetable_link,
+               latitude, longitude
+        FROM bus_stops
+    """)
+    found = []
+    for s in stops:
+        lat, lng = _vx_float(s.get("latitude")), _vx_float(s.get("longitude"))
+        dist = None
+        if center and lat is not None and lng is not None:
+            dist = round(_haversine_km(center[0], center[1], lat, lng), 1)
+        by_name = (
+            (s.get("taluka_name") or "").strip().lower() == taluka.lower()
+            and village.lower() in (s.get("stop_name") or "").lower()
+        )
+        if by_name or (dist is not None and dist <= VX_BUS_RADIUS_KM):
+            s["latitude"], s["longitude"], s["distance_km"] = lat, lng, dist
+            s["_by_name"] = by_name
+            found.append(s)
+    found.sort(key=lambda s: (not s["_by_name"], s["distance_km"] if s["distance_km"] is not None else 9999))
+    for s in found:
+        s.pop("_by_name", None)
+    return found[:VX_BUS_LIMIT]
+
+
+# ---------------- Public ----------------
+
+@bp.route('/api/explore-villages', methods=['GET'])
+def list_explore_villages():
+    """Published villages for the Explore Villages cards."""
+    try:
+        rows = _rows(f"""
+            SELECT v.taluka_name, v.village_name, v.tagline, v.hero_image,
+                   {_VX_PLACES_COUNT} AS place_count,
+                   {_VX_STAYS_COUNT} AS stay_count
+            FROM village_explore v
+            WHERE v.status = 'published'
+            ORDER BY v.taluka_name, v.village_name
+        """)
+        return jsonify(rows), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@bp.route('/api/explore-villages/<taluka>/<village>', methods=['GET'])
+def get_explore_village(taluka, village):
+    """One village: editorial content + places and homestays pulled live."""
+    try:
+        rows = _rows("""
+            SELECT id, taluka_name, village_name, tagline, hero_image, intro, history,
+                   history_timeline, food, flowers, birds, festivals, gallery,
+                   how_to_reach, best_time
+            FROM village_explore
+            WHERE status = 'published'
+              AND lower(taluka_name) = lower(:taluka)
+              AND lower(village_name) = lower(:village)
+        """, {"taluka": taluka, "village": village})
+        if not rows:
+            return jsonify({"success": False, "error": "Village not found."}), 404
+        data = rows[0]
+
+        match = {"taluka": data["taluka_name"], "village": data["village_name"]}
+
+        data["places"] = _rows("""
+            SELECT id, location_name, attraction_type, nearest_landmark,
+                   seasonal_availability, avg_time_spent, photo_location,
+                   latitude, longitude
+            FROM locations
+            WHERE lower(trim(village_name)) = lower(trim(:village))
+              AND lower(trim(taluka_name)) = lower(trim(:taluka))
+            ORDER BY location_name
+        """, match)
+
+        stays = _rows("""
+            SELECT * FROM homestays
+            WHERE lower(trim(village_town_city)) = lower(trim(:village))
+              AND lower(trim(taluka_name)) = lower(trim(:taluka))
+            ORDER BY homestay_name
+        """, match)
+        data["homestays"] = _public_rows(stays, "homestays")
+
+        # ATMs located in the village (empty list if the atms table doesn't exist).
+        data["atms"] = _rows("""
+            SELECT id, atm_name, bank_name, address, google_maps_link,
+                   latitude, longitude, is_24x7, has_cash_deposit, photo_url
+            FROM atms
+            WHERE lower(trim(village_name)) = lower(trim(:village))
+              AND lower(trim(taluka_name)) = lower(trim(:taluka))
+            ORDER BY bank_name, atm_name
+        """, match)
+
+        # Drivers based in the village, or whose service area mentions it.
+        # Email is never selected; phone is public, as on the map.
+        data["drivers"] = _rows("""
+            SELECT id, driver_name, phone_number, vehicle_type, base_village,
+                   service_area, per_day_rate, driver_photo, vehicle_photo
+            FROM drivers
+            WHERE (lower(trim(base_village)) = lower(trim(:village))
+                   AND lower(trim(taluka_name)) = lower(trim(:taluka)))
+               OR service_area ILIKE '%' || trim(:village) || '%'
+            ORDER BY driver_name
+        """, match)
+
+        center = _vx_center(data["places"], stays, data["atms"])
+        data["bus_stops"] = _vx_bus_stops(data["taluka_name"], data["village_name"], center)
+
+        return jsonify({"success": True, "village": data}), 200
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+# ---------------- Admin ----------------
+
+@bp.route('/api/admin/explore-villages', methods=['GET'])
+@admin_required
+def admin_list_explore_villages():
+    try:
+        rows = _rows("""
+            SELECT id, taluka_name, village_name, tagline, status,
+                   updated_at::text AS updated_at
+            FROM village_explore
+            ORDER BY taluka_name, village_name
+        """)
+        return jsonify(rows), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@bp.route('/api/admin/explore-villages/<int:id>', methods=['GET'])
+@admin_required
+def admin_get_explore_village(id):
+    try:
+        rows = _rows("SELECT * FROM village_explore WHERE id = :id", {"id": id})
+        if not rows:
+            return jsonify({"success": False, "error": "Not found."}), 404
+        row = rows[0]
+        row["created_at"] = str(row.get("created_at") or "")
+        row["updated_at"] = str(row.get("updated_at") or "")
+        return jsonify(row), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@bp.route('/api/admin/explore-villages', methods=['POST'])
+@admin_required
+def admin_create_explore_village():
+    try:
+        values, error = _vx_values(request.get_json(silent=True) or {})
+        if error:
+            return jsonify({"success": False, "error": error}), 400
+
+        exists = db.session.execute(text("""
+            SELECT 1 FROM village_explore
+            WHERE lower(taluka_name) = lower(:taluka_name)
+              AND lower(village_name) = lower(:village_name)
+        """), values).first()
+        if exists:
+            return jsonify({"success": False,
+                            "error": "This village already has a page. Edit it from the list."}), 409
+
+        row = db.session.execute(text("""
+            INSERT INTO village_explore (
+                taluka_name, village_name, tagline, hero_image, intro, history,
+                history_timeline, food, flowers, birds, festivals, gallery,
+                how_to_reach, best_time, status
+            ) VALUES (
+                :taluka_name, :village_name, :tagline, :hero_image, :intro, :history,
+                CAST(:history_timeline AS jsonb), CAST(:food AS jsonb),
+                CAST(:flowers AS jsonb), CAST(:birds AS jsonb),
+                CAST(:festivals AS jsonb), CAST(:gallery AS jsonb),
+                :how_to_reach, :best_time, :status
+            ) RETURNING id
+        """), values).first()
+        db.session.commit()
+        return jsonify({"success": True, "id": row[0]}), 201
+
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@bp.route('/api/admin/explore-villages/<int:id>', methods=['PUT'])
+@admin_required
+def admin_update_explore_village(id):
+    """Taluka and village name are fixed once created; everything else is editable."""
+    try:
+        values, error = _vx_values(request.get_json(silent=True) or {})
+        if error:
+            return jsonify({"success": False, "error": error}), 400
+        values["id"] = id
+
+        result = db.session.execute(text("""
+            UPDATE village_explore SET
+                tagline = :tagline, hero_image = :hero_image, intro = :intro,
+                history = :history,
+                history_timeline = CAST(:history_timeline AS jsonb),
+                food = CAST(:food AS jsonb), flowers = CAST(:flowers AS jsonb),
+                birds = CAST(:birds AS jsonb), festivals = CAST(:festivals AS jsonb),
+                gallery = CAST(:gallery AS jsonb),
+                how_to_reach = :how_to_reach, best_time = :best_time,
+                status = :status, updated_at = NOW()
+            WHERE id = :id
+        """), values)
+        db.session.commit()
+
+        if result.rowcount == 0:
+            return jsonify({"success": False, "error": "Not found."}), 404
+        return jsonify({"success": True}), 200
+
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@bp.route('/api/admin/explore-villages/<int:id>', methods=['DELETE'])
+@admin_required
+def admin_delete_explore_village(id):
+    try:
+        result = db.session.execute(
+            text("DELETE FROM village_explore WHERE id = :id"), {"id": id}
+        )
+        db.session.commit()
+        if result.rowcount == 0:
+            return jsonify({"success": False, "error": "Not found."}), 404
+        return jsonify({"success": True}), 200
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({"success": False, "error": str(e)}), 500
