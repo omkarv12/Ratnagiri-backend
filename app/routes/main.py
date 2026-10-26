@@ -3641,3 +3641,306 @@ def admin_delete_itinerary(id):
     except Exception as e:
         db.session.rollback()
         return jsonify({"success": False, "error": str(e)}), 500
+
+# ==================================================================
+# Circuits
+# Requires circuits.sql to have been run on the database first.
+#
+# PASTE THIS AT THE VERY END of your routes file (the one that defines `bp`).
+# It needs no new imports: it uses json, text, db, request, jsonify,
+# _rows, _clean, unique_slug and admin_required, which that file already has.
+# Photos are uploaded through your existing POST /api/upload-photo (Cloudinary).
+# ==================================================================
+
+CI_THEMES = ("Beaches", "Heritage", "Nature", "Spiritual", "Food", "Adventure", "Mixed")
+CI_MAX_STOPS = 30
+
+
+def _ci_float(value):
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _ci_first_url(value):
+    for part in str(value or "").split(","):
+        part = part.strip()
+        if part.startswith("http"):
+            return part
+    return ""
+
+
+def _ci_lines(raw, limit, size):
+    """Highlights / tips: a list of short strings, empties dropped."""
+    items = raw if isinstance(raw, list) else []
+    cleaned = [_clean(str(t), size) for t in items[:limit]]
+    return [t for t in cleaned if t]
+
+
+def _ci_stops(raw):
+    """Clean the stops the admin sent. Stops without a name are dropped."""
+    stops = []
+    for s in (raw if isinstance(raw, list) else [])[:CI_MAX_STOPS]:
+        if not isinstance(s, dict):
+            continue
+        name = _clean(s.get("name"), 150)
+        if not name:
+            continue
+
+        link_id = None
+        if s.get("link_id") not in (None, ""):
+            try:
+                link_id = int(s.get("link_id"))
+            except (TypeError, ValueError):
+                link_id = None
+
+        distance = _ci_float(s.get("distance_km"))
+        if distance is not None and not (0 <= distance <= 2000):
+            distance = None
+
+        image = _clean(s.get("image_url"), 500)
+        stops.append({
+            "name": name,
+            "description": _clean(s.get("description"), 800),
+            "image_url": image if image.startswith("https://") else "",
+            "time_needed": _clean(s.get("time_needed"), 60),
+            "distance_km": round(distance, 1) if distance is not None else None,
+            "link_id": link_id,
+        })
+    return stops
+
+
+def _ci_values(data):
+    """Returns (values, error). Values are ready to bind to the SQL below."""
+    title = _clean(data.get("title"), 200)
+    if not title:
+        return None, "Title is required."
+
+    stops = _ci_stops(data.get("stops"))
+    if not stops:
+        return None, "Add at least one stop."
+
+    hero = _clean(data.get("hero_image"), 500)
+    if hero and not hero.startswith("https://"):
+        return None, "Hero image URL must start with https://"
+
+    # Use the typed total if given, otherwise add up the distances between stops.
+    total = _ci_float(data.get("total_distance_km"))
+    if total is None or total <= 0:
+        total = round(sum(s["distance_km"] or 0 for s in stops), 1) or None
+
+    try:
+        duration = max(1, min(30, int(float(data.get("duration_days") or 1))))
+    except (TypeError, ValueError):
+        duration = 1
+    try:
+        display_order = int(data.get("display_order") or 0)
+    except (TypeError, ValueError):
+        display_order = 0
+
+    theme = data.get("theme")
+    status = data.get("status")
+    return {
+        "title": title,
+        "tagline": _clean(data.get("tagline"), 250),
+        "hero_image": hero,
+        "summary": _clean(data.get("summary"), 3000),
+        "theme": theme if theme in CI_THEMES else "Mixed",
+        "total_distance_km": total,
+        "duration_days": duration,
+        "best_season": _clean(data.get("best_season"), 120),
+        "start_point": _clean(data.get("start_point"), 150),
+        "end_point": _clean(data.get("end_point"), 150),
+        "stops": json.dumps(stops),
+        "highlights": json.dumps(_ci_lines(data.get("highlights"), 12, 200)),
+        "tips": json.dumps(_ci_lines(data.get("tips"), 12, 300)),
+        "how_to_reach": _clean(data.get("how_to_reach"), 1500),
+        "display_order": display_order,
+        "status": status if status in ("published", "draft") else "published",
+    }, None
+
+
+def _ci_enrich(stops):
+    """Attach live photo / coordinates to stops linked to a location.
+    Returns (stops, map_url) where map_url is a Google Maps route through them."""
+    ids = {s["link_id"] for s in stops if s.get("link_id")}
+    places = {}
+    if ids:
+        for r in _rows("""
+            SELECT id, location_name, village_name, photo_location, latitude, longitude
+            FROM locations WHERE id = ANY(:ids)
+        """, {"ids": list(ids)}):
+            places[r["id"]] = r
+
+    points = []
+    for s in stops:
+        s["linked"] = None
+        r = places.get(s.get("link_id"))
+        if not r:
+            continue
+        lat, lng = _ci_float(r.get("latitude")), _ci_float(r.get("longitude"))
+        s["linked"] = {
+            "id": r["id"],
+            "name": r["location_name"],
+            "area": r["village_name"],
+            "image": _ci_first_url(r["photo_location"]),
+            "lat": lat,
+            "lng": lng,
+        }
+        if lat is not None and lng is not None:
+            points.append(f"{lat},{lng}")
+
+    points = points[:10]
+    if len(points) >= 2:
+        map_url = "https://www.google.com/maps/dir/" + "/".join(points)
+    elif len(points) == 1:
+        map_url = f"https://www.google.com/maps/search/?api=1&query={points[0]}"
+    else:
+        map_url = None
+    return stops, map_url
+
+
+# ---------------- Public ----------------
+
+@bp.route('/api/circuits', methods=['GET'])
+def list_circuits():
+    try:
+        rows = _rows("""
+            SELECT slug, title, tagline, hero_image, theme, total_distance_km,
+                   duration_days, best_season, start_point, end_point, stops
+            FROM circuits
+            WHERE status = 'published'
+            ORDER BY display_order, id
+        """)
+        for r in rows:
+            r["stop_count"] = len(r.pop("stops") or [])
+        return jsonify(rows), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@bp.route('/api/circuits/<slug>', methods=['GET'])
+def get_circuit(slug):
+    try:
+        rows = _rows("""
+            SELECT slug, title, tagline, hero_image, summary, theme, total_distance_km,
+                   duration_days, best_season, start_point, end_point,
+                   stops, highlights, tips, how_to_reach
+            FROM circuits
+            WHERE status = 'published' AND slug = :slug
+        """, {"slug": slug})
+        if not rows:
+            return jsonify({"success": False, "error": "Circuit not found."}), 404
+        data = rows[0]
+        data["stops"], data["map_url"] = _ci_enrich(data["stops"] or [])
+        return jsonify({"success": True, "circuit": data}), 200
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+# ---------------- Admin ----------------
+
+@bp.route('/api/admin/circuits', methods=['GET'])
+@admin_required
+def admin_list_circuits():
+    try:
+        rows = _rows("""
+            SELECT id, slug, title, theme, total_distance_km, duration_days,
+                   status, updated_at::text AS updated_at
+            FROM circuits
+            ORDER BY display_order, id
+        """)
+        return jsonify(rows), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@bp.route('/api/admin/circuits/<int:id>', methods=['GET'])
+@admin_required
+def admin_get_circuit(id):
+    try:
+        rows = _rows("SELECT * FROM circuits WHERE id = :id", {"id": id})
+        if not rows:
+            return jsonify({"success": False, "error": "Not found."}), 404
+        row = rows[0]
+        row["created_at"] = str(row.get("created_at") or "")
+        row["updated_at"] = str(row.get("updated_at") or "")
+        return jsonify(row), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@bp.route('/api/admin/circuits', methods=['POST'])
+@admin_required
+def admin_create_circuit():
+    try:
+        values, error = _ci_values(request.get_json(silent=True) or {})
+        if error:
+            return jsonify({"success": False, "error": error}), 400
+        values["slug"] = unique_slug(values["title"], "circuits")
+
+        row = db.session.execute(text("""
+            INSERT INTO circuits (
+                slug, title, tagline, hero_image, summary, theme, total_distance_km,
+                duration_days, best_season, start_point, end_point,
+                stops, highlights, tips, how_to_reach, display_order, status
+            ) VALUES (
+                :slug, :title, :tagline, :hero_image, :summary, :theme, :total_distance_km,
+                :duration_days, :best_season, :start_point, :end_point,
+                CAST(:stops AS jsonb), CAST(:highlights AS jsonb), CAST(:tips AS jsonb),
+                :how_to_reach, :display_order, :status
+            ) RETURNING id
+        """), values).first()
+        db.session.commit()
+        return jsonify({"success": True, "id": row[0], "slug": values["slug"]}), 201
+
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@bp.route('/api/admin/circuits/<int:id>', methods=['PUT'])
+@admin_required
+def admin_update_circuit(id):
+    """The slug (and so the public link) stays the same when the title changes."""
+    try:
+        values, error = _ci_values(request.get_json(silent=True) or {})
+        if error:
+            return jsonify({"success": False, "error": error}), 400
+        values["id"] = id
+
+        result = db.session.execute(text("""
+            UPDATE circuits SET
+                title = :title, tagline = :tagline, hero_image = :hero_image,
+                summary = :summary, theme = :theme, total_distance_km = :total_distance_km,
+                duration_days = :duration_days, best_season = :best_season,
+                start_point = :start_point, end_point = :end_point,
+                stops = CAST(:stops AS jsonb), highlights = CAST(:highlights AS jsonb),
+                tips = CAST(:tips AS jsonb), how_to_reach = :how_to_reach,
+                display_order = :display_order, status = :status, updated_at = NOW()
+            WHERE id = :id
+        """), values)
+        db.session.commit()
+
+        if result.rowcount == 0:
+            return jsonify({"success": False, "error": "Not found."}), 404
+        return jsonify({"success": True}), 200
+
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@bp.route('/api/admin/circuits/<int:id>', methods=['DELETE'])
+@admin_required
+def admin_delete_circuit(id):
+    try:
+        result = db.session.execute(text("DELETE FROM circuits WHERE id = :id"), {"id": id})
+        db.session.commit()
+        if result.rowcount == 0:
+            return jsonify({"success": False, "error": "Not found."}), 404
+        return jsonify({"success": True}), 200
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({"success": False, "error": str(e)}), 500
