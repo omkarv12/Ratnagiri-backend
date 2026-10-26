@@ -3334,3 +3334,310 @@ def admin_delete_explore_village(id):
     except Exception as e:
         db.session.rollback()
         return jsonify({"success": False, "error": str(e)}), 500
+# ==================================================================
+# Itineraries
+# Requires itineraries.sql to have been run on the database first.
+#
+# PASTE THIS AT THE VERY END of your routes file (the one that defines `bp`).
+# It needs no new imports: it uses json, text, db, request, jsonify,
+# _rows, _clean, unique_slug and admin_required, which that file already has.
+# Photos are uploaded through your existing POST /api/upload-photo (Cloudinary).
+# ==================================================================
+
+IT_THEMES = ("Beaches", "Heritage", "Nature", "Spiritual", "Food", "Adventure", "Mixed")
+IT_STOP_TYPES = ("visit", "stay", "food", "travel", "activity")
+IT_MAX_DAYS = 14
+
+
+def _it_first_url(value):
+    for part in str(value or "").split(","):
+        part = part.strip()
+        if part.startswith("http"):
+            return part
+    return ""
+
+
+def _it_float(value):
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _it_days(raw):
+    """Clean the days/stops the admin sent. Empty stops are dropped."""
+    days = []
+    for d in (raw if isinstance(raw, list) else [])[:IT_MAX_DAYS]:
+        if not isinstance(d, dict):
+            continue
+        stops = []
+        raw_stops = d.get("stops") if isinstance(d.get("stops"), list) else []
+        for s in raw_stops[:20]:
+            if not isinstance(s, dict):
+                continue
+            title = _clean(s.get("title"), 150)
+            if not title:
+                continue
+            stype = s.get("type") if s.get("type") in IT_STOP_TYPES else "activity"
+
+            link_id = None
+            if stype in ("visit", "stay") and s.get("link_id") not in (None, ""):
+                try:
+                    link_id = int(s.get("link_id"))
+                except (TypeError, ValueError):
+                    link_id = None
+
+            image = _clean(s.get("image_url"), 500)
+            stops.append({
+                "type": stype,
+                "time": _clean(s.get("time"), 40),
+                "title": title,
+                "description": _clean(s.get("description"), 800),
+                "image_url": image if image.startswith("https://") else "",
+                "link_id": link_id,
+            })
+        title = _clean(d.get("title"), 150)
+        if title or stops:
+            days.append({"title": title, "summary": _clean(d.get("summary"), 800), "stops": stops})
+    return days
+
+
+def _it_values(data):
+    """Returns (values, error). Values are ready to bind to the SQL below."""
+    title = _clean(data.get("title"), 200)
+    if not title:
+        return None, "Title is required."
+
+    days = _it_days(data.get("days"))
+    if not days or not any(d["stops"] for d in days):
+        return None, "Add at least one day with one stop."
+
+    hero = _clean(data.get("hero_image"), 500)
+    if hero and not hero.startswith("https://"):
+        return None, "Hero image URL must start with https://"
+
+    tips = [_clean(t, 300) for t in (data.get("tips") if isinstance(data.get("tips"), list) else [])[:12]]
+    tips = [t for t in tips if t]
+
+    theme = data.get("theme")
+    status = data.get("status")
+    try:
+        display_order = int(data.get("display_order") or 0)
+    except (TypeError, ValueError):
+        display_order = 0
+
+    return {
+        "title": title,
+        "tagline": _clean(data.get("tagline"), 250),
+        "hero_image": hero,
+        "summary": _clean(data.get("summary"), 3000),
+        "theme": theme if theme in IT_THEMES else "Mixed",
+        "duration_days": len(days),
+        "best_season": _clean(data.get("best_season"), 120),
+        "budget_note": _clean(data.get("budget_note"), 200),
+        "suited_for": _clean(data.get("suited_for"), 200),
+        "start_point": _clean(data.get("start_point"), 150),
+        "end_point": _clean(data.get("end_point"), 150),
+        "days": json.dumps(days),
+        "tips": json.dumps(tips),
+        "how_to_reach": _clean(data.get("how_to_reach"), 1500),
+        "display_order": display_order,
+        "status": status if status in ("published", "draft") else "published",
+    }, None
+
+
+def _it_enrich_days(days):
+    """Attach live photo / coordinates to stops linked to a location or homestay,
+    and a Google Maps route link to each day."""
+    place_ids = {s["link_id"] for d in days for s in d["stops"] if s.get("type") == "visit" and s.get("link_id")}
+    stay_ids = {s["link_id"] for d in days for s in d["stops"] if s.get("type") == "stay" and s.get("link_id")}
+
+    places, stays = {}, {}
+    if place_ids:
+        for r in _rows("""
+            SELECT id, location_name, village_name, photo_location, latitude, longitude
+            FROM locations WHERE id = ANY(:ids)
+        """, {"ids": list(place_ids)}):
+            places[r["id"]] = r
+    if stay_ids:
+        for r in _rows("""
+            SELECT id, homestay_name, village_town_city, photo_homestay, latitude, longitude
+            FROM homestays WHERE id = ANY(:ids)
+        """, {"ids": list(stay_ids)}):
+            stays[r["id"]] = r
+
+    for d in days:
+        points = []
+        for s in d["stops"]:
+            s["linked"] = None
+            row = places.get(s.get("link_id")) if s.get("type") == "visit" else (
+                stays.get(s.get("link_id")) if s.get("type") == "stay" else None
+            )
+            if not row:
+                continue
+            is_place = s["type"] == "visit"
+            lat, lng = _it_float(row.get("latitude")), _it_float(row.get("longitude"))
+            s["linked"] = {
+                "kind": "location" if is_place else "homestay",
+                "id": row["id"],
+                "name": row["location_name"] if is_place else row["homestay_name"],
+                "area": row["village_name"] if is_place else row["village_town_city"],
+                "image": _it_first_url(row["photo_location"] if is_place else row["photo_homestay"]),
+                "lat": lat,
+                "lng": lng,
+            }
+            if lat is not None and lng is not None:
+                points.append(f"{lat},{lng}")
+
+        points = points[:10]
+        if len(points) >= 2:
+            d["map_url"] = "https://www.google.com/maps/dir/" + "/".join(points)
+        elif len(points) == 1:
+            d["map_url"] = f"https://www.google.com/maps/search/?api=1&query={points[0]}"
+        else:
+            d["map_url"] = None
+    return days
+
+
+# ---------------- Public ----------------
+
+@bp.route('/api/itineraries', methods=['GET'])
+def list_itineraries():
+    try:
+        rows = _rows("""
+            SELECT slug, title, tagline, hero_image, theme, duration_days,
+                   best_season, budget_note, suited_for, days
+            FROM itineraries
+            WHERE status = 'published'
+            ORDER BY display_order, id
+        """)
+        for r in rows:
+            r["stop_count"] = sum(len(d.get("stops", [])) for d in (r.pop("days") or []))
+        return jsonify(rows), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@bp.route('/api/itineraries/<slug>', methods=['GET'])
+def get_itinerary(slug):
+    try:
+        rows = _rows("""
+            SELECT slug, title, tagline, hero_image, summary, theme, duration_days,
+                   best_season, budget_note, suited_for, start_point, end_point,
+                   days, tips, how_to_reach
+            FROM itineraries
+            WHERE status = 'published' AND slug = :slug
+        """, {"slug": slug})
+        if not rows:
+            return jsonify({"success": False, "error": "Itinerary not found."}), 404
+        data = rows[0]
+        data["days"] = _it_enrich_days(data["days"] or [])
+        return jsonify({"success": True, "itinerary": data}), 200
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+# ---------------- Admin ----------------
+
+@bp.route('/api/admin/itineraries', methods=['GET'])
+@admin_required
+def admin_list_itineraries():
+    try:
+        rows = _rows("""
+            SELECT id, slug, title, theme, duration_days, status, updated_at::text AS updated_at
+            FROM itineraries
+            ORDER BY display_order, id
+        """)
+        return jsonify(rows), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@bp.route('/api/admin/itineraries/<int:id>', methods=['GET'])
+@admin_required
+def admin_get_itinerary(id):
+    try:
+        rows = _rows("SELECT * FROM itineraries WHERE id = :id", {"id": id})
+        if not rows:
+            return jsonify({"success": False, "error": "Not found."}), 404
+        row = rows[0]
+        row["created_at"] = str(row.get("created_at") or "")
+        row["updated_at"] = str(row.get("updated_at") or "")
+        return jsonify(row), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@bp.route('/api/admin/itineraries', methods=['POST'])
+@admin_required
+def admin_create_itinerary():
+    try:
+        values, error = _it_values(request.get_json(silent=True) or {})
+        if error:
+            return jsonify({"success": False, "error": error}), 400
+        values["slug"] = unique_slug(values["title"], "itineraries")
+
+        row = db.session.execute(text("""
+            INSERT INTO itineraries (
+                slug, title, tagline, hero_image, summary, theme, duration_days,
+                best_season, budget_note, suited_for, start_point, end_point,
+                days, tips, how_to_reach, display_order, status
+            ) VALUES (
+                :slug, :title, :tagline, :hero_image, :summary, :theme, :duration_days,
+                :best_season, :budget_note, :suited_for, :start_point, :end_point,
+                CAST(:days AS jsonb), CAST(:tips AS jsonb), :how_to_reach,
+                :display_order, :status
+            ) RETURNING id
+        """), values).first()
+        db.session.commit()
+        return jsonify({"success": True, "id": row[0], "slug": values["slug"]}), 201
+
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@bp.route('/api/admin/itineraries/<int:id>', methods=['PUT'])
+@admin_required
+def admin_update_itinerary(id):
+    """The slug (and so the public link) stays the same when the title changes."""
+    try:
+        values, error = _it_values(request.get_json(silent=True) or {})
+        if error:
+            return jsonify({"success": False, "error": error}), 400
+        values["id"] = id
+
+        result = db.session.execute(text("""
+            UPDATE itineraries SET
+                title = :title, tagline = :tagline, hero_image = :hero_image,
+                summary = :summary, theme = :theme, duration_days = :duration_days,
+                best_season = :best_season, budget_note = :budget_note,
+                suited_for = :suited_for, start_point = :start_point, end_point = :end_point,
+                days = CAST(:days AS jsonb), tips = CAST(:tips AS jsonb),
+                how_to_reach = :how_to_reach, display_order = :display_order,
+                status = :status, updated_at = NOW()
+            WHERE id = :id
+        """), values)
+        db.session.commit()
+
+        if result.rowcount == 0:
+            return jsonify({"success": False, "error": "Not found."}), 404
+        return jsonify({"success": True}), 200
+
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@bp.route('/api/admin/itineraries/<int:id>', methods=['DELETE'])
+@admin_required
+def admin_delete_itinerary(id):
+    try:
+        result = db.session.execute(text("DELETE FROM itineraries WHERE id = :id"), {"id": id})
+        db.session.commit()
+        if result.rowcount == 0:
+            return jsonify({"success": False, "error": "Not found."}), 404
+        return jsonify({"success": True}), 200
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({"success": False, "error": str(e)}), 500
