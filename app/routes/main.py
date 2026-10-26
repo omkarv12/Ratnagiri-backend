@@ -1330,6 +1330,7 @@ def approve_location(id):
         
 
     except Exception as e:
+        db.session.rollback()
         return jsonify({
             "success": False,
             "error": str(e)
@@ -1819,9 +1820,27 @@ def _one(sql):
     return rows[0] if rows else {}
 
 
+def _group(table, column, fallback="Other", where="", limit=None):
+    """COUNT(*) grouped by one column -> [{label, value}]. Arguments are fixed
+    strings written in this file, never request input."""
+    sql = (
+        f"SELECT COALESCE(NULLIF({column}::text, ''), '{fallback}') AS label, "
+        f"COUNT(*) AS value FROM {table} {where} GROUP BY 1 ORDER BY value DESC, label"
+    )
+    if limit:
+        sql += f" LIMIT {int(limit)}"
+    return _rows(sql)
+
+
+def _yes(column):
+    """SQL fragment: true when a text / boolean column means 'yes'."""
+    return f"COALESCE(({column})::text, '') ~* '^(y|yes|true|t|1)'"
+
+
 @bp.route('/api/admin/analytics', methods=['GET'])
 def admin_analytics():
     try:
+        # ---------------- totals & pending ----------------
         totals = {
             "locations": _scalar("SELECT COUNT(*) FROM locations"),
             "homestays": _scalar("SELECT COUNT(*) FROM homestays"),
@@ -1831,6 +1850,15 @@ def admin_analytics():
             "village_profiles": _scalar("SELECT COUNT(*) FROM village_profiles"),
             "stories_published": _scalar("SELECT COUNT(*) FROM blogs WHERE status = 'published'"),
             "events_approved": _scalar("SELECT COUNT(*) FROM tourism_events WHERE status = 'approved'"),
+            # new
+            "atms": _scalar("SELECT COUNT(*) FROM atms"),
+            "medical_facilities": _scalar("SELECT COUNT(*) FROM medical_facilities WHERE is_active"),
+            "police_stations": _scalar("SELECT COUNT(*) FROM police_stations WHERE is_active"),
+            "hidden_paths": _scalar("SELECT COUNT(*) FROM hidden_paths WHERE status = 'approved'"),
+            "itineraries": _scalar("SELECT COUNT(*) FROM itineraries WHERE status = 'published'"),
+            "circuits": _scalar("SELECT COUNT(*) FROM circuits WHERE status = 'published'"),
+            "explore_villages": _scalar("SELECT COUNT(*) FROM village_explore WHERE status = 'published'"),
+            "experiences": _scalar("SELECT COUNT(*) FROM experiences WHERE status = 'published'"),
         }
 
         pending = {
@@ -1838,8 +1866,27 @@ def admin_analytics():
             "homestays": _scalar("SELECT COUNT(*) FROM pending_homestays"),
             "drivers": _scalar("SELECT COUNT(*) FROM pending_drivers"),
             "events": _scalar("SELECT COUNT(*) FROM tourism_events WHERE status = 'pending'"),
+            "hidden_paths": _scalar("SELECT COUNT(*) FROM hidden_paths WHERE status = 'pending'"),
         }
 
+        # How long have people been waiting? (days)
+        pending_union = """
+            SELECT submitted_at AS t FROM pending_locations
+            UNION ALL SELECT submitted_at FROM pending_homestays
+            UNION ALL SELECT submitted_at FROM pending_drivers
+            UNION ALL SELECT created_at FROM tourism_events WHERE status = 'pending'
+            UNION ALL SELECT created_at FROM hidden_paths WHERE status = 'pending'
+        """
+        pending_age = {
+            "oldest_days": int(_scalar(
+                f"SELECT COALESCE(MAX(EXTRACT(EPOCH FROM (NOW() - t)) / 86400), 0) FROM ({pending_union}) x"
+            ) or 0),
+            "over_7_days": int(_scalar(
+                f"SELECT COUNT(*) FROM ({pending_union}) x WHERE t < NOW() - interval '7 days'"
+            ) or 0),
+        }
+
+        # ---------------- coverage (existing) ----------------
         locations_by_taluka = _rows("""
             SELECT COALESCE(NULLIF(taluka_name, ''), 'Unknown') AS label, COUNT(*) AS value
             FROM locations GROUP BY 1 ORDER BY value DESC
@@ -1848,18 +1895,9 @@ def admin_analytics():
             SELECT COALESCE(NULLIF(taluka_name, ''), 'Unknown') AS label, COUNT(*) AS value
             FROM homestays GROUP BY 1 ORDER BY value DESC
         """)
-        locations_by_type = _rows("""
-            SELECT COALESCE(NULLIF(attraction_type, ''), 'Other') AS label, COUNT(*) AS value
-            FROM locations GROUP BY 1 ORDER BY value DESC
-        """)
-        homestays_by_type = _rows("""
-            SELECT COALESCE(NULLIF(homestay_type, ''), 'Other') AS label, COUNT(*) AS value
-            FROM homestays GROUP BY 1 ORDER BY value DESC
-        """)
-        road_condition = _rows("""
-            SELECT COALESCE(NULLIF(road_condition::text, ''), 'Not stated') AS label, COUNT(*) AS value
-            FROM locations GROUP BY 1 ORDER BY value DESC
-        """)
+        locations_by_type = _group("locations", "attraction_type")
+        homestays_by_type = _group("homestays", "homestay_type")
+        road_condition = _group("locations", "road_condition", "Not stated")
 
         location_readiness = _one("""
             SELECT COUNT(*) AS total,
@@ -1886,6 +1924,92 @@ def admin_analytics():
             FROM homestays
         """)
 
+        # ---------------- coverage (new) ----------------
+        locations_by_village = _rows("""
+            SELECT l.village_name || ' (' || COALESCE(NULLIF(l.taluka_name, ''), '?') || ')' AS label,
+                   COUNT(*) AS value
+            FROM locations l
+            WHERE COALESCE(trim(l.village_name), '') <> ''
+            GROUP BY l.village_name, l.taluka_name
+            ORDER BY value DESC, label
+            LIMIT 10
+        """)
+
+        location_facilities = _one(f"""
+            SELECT COUNT(*) AS total,
+                   COUNT(*) FILTER (WHERE {_yes('parking_space')}) AS parking,
+                   COUNT(*) FILTER (WHERE {_yes('food_stalls')}) AS food_stalls,
+                   COUNT(*) FILTER (WHERE {_yes('public_transport')}) AS public_transport,
+                   COUNT(*) FILTER (
+                       WHERE COALESCE(entry_fee::text, '') ~* '^(n|no|free|false|f|0)'
+                   ) AS free_entry
+            FROM locations
+        """)
+        locations_by_crowd = _group("locations", "crowd_level", "Not stated")
+        locations_by_season = _group("locations", "seasonal_availability", "Not stated", limit=8)
+
+        homestay_facilities = _one(f"""
+            SELECT COUNT(*) AS total,
+                   COUNT(*) FILTER (WHERE {_yes('veg_meals')}) AS veg_meals,
+                   COUNT(*) FILTER (WHERE {_yes('guides_available')}) AS guides,
+                   COUNT(*) FILTER (WHERE {_yes('live_on_premises')}) AS host_on_site,
+                   COUNT(*) FILTER (WHERE {_yes('discoverable_google_map')}) AS on_google_maps,
+                   COUNT(*) FILTER (
+                       WHERE COALESCE(trim(social_media_page), '') <> ''
+                   ) AS social_media
+            FROM homestays
+        """)
+
+        # ---------------- services & infrastructure ----------------
+        drivers_by_taluka = _group("drivers", "taluka_name", "Unknown")
+        drivers_by_vehicle = _group("drivers", "vehicle_type", "Other")
+        bus_stops_by_taluka = _group("bus_stops", "taluka_name", "Unknown")
+
+        atms = {
+            "total": totals["atms"],
+            "open_24x7": _scalar("SELECT COUNT(*) FROM atms WHERE is_24x7"),
+            "cash_deposit": _scalar("SELECT COUNT(*) FROM atms WHERE has_cash_deposit"),
+            "by_bank": _group("atms", "bank_name", "Unknown", limit=8),
+            "by_taluka": _group("atms", "taluka_name", "Unknown"),
+        }
+
+        health_services = {
+            "medical_by_category": _group("medical_facilities", "category", "Other", where="WHERE is_active"),
+            "medical_24x7": _scalar("SELECT COUNT(*) FROM medical_facilities WHERE is_active AND is_24x7"),
+            "medical_with_emergency": _scalar(
+                "SELECT COUNT(*) FROM medical_facilities WHERE is_active AND emergency_available"),
+            "police_by_category": _group("police_stations", "category", "Other", where="WHERE is_active"),
+            "police_tourist_help": _scalar("SELECT COUNT(*) FROM police_stations WHERE is_active AND tourist_help"),
+        }
+
+        # ---------------- content library ----------------
+        content = {
+            "itineraries": {
+                "published": totals["itineraries"],
+                "drafts": _scalar("SELECT COUNT(*) FROM itineraries WHERE status <> 'published'"),
+            },
+            "circuits": {
+                "published": totals["circuits"],
+                "drafts": _scalar("SELECT COUNT(*) FROM circuits WHERE status <> 'published'"),
+            },
+            "explore_villages": {
+                "published": totals["explore_villages"],
+                "drafts": _scalar("SELECT COUNT(*) FROM village_explore WHERE status <> 'published'"),
+            },
+            "experiences_by_category": _group(
+                "experiences", "category", "Other", where="WHERE status = 'published'"),
+            "experiences_drafts": _scalar("SELECT COUNT(*) FROM experiences WHERE status <> 'published'"),
+        }
+
+        hidden_paths = {
+            "by_status": _group("hidden_paths", "status", "unknown"),
+            "by_type": _group("hidden_paths", "path_type", "Other", where="WHERE status = 'approved'"),
+            "by_difficulty": _group("hidden_paths", "difficulty", "Other", where="WHERE status = 'approved'"),
+            "total_km": float(_scalar(
+                "SELECT COALESCE(SUM(length_km), 0) FROM hidden_paths WHERE status = 'approved'") or 0),
+        }
+
+        # ---------------- events ----------------
         events_by_month = _rows("""
             SELECT to_char(g.m, 'Mon') AS label, COUNT(e.id) AS value
             FROM generate_series(
@@ -1903,7 +2027,20 @@ def admin_analytics():
             FROM tourism_events WHERE status = 'approved'
             GROUP BY category ORDER BY value DESC
         """)
+        events_summary = {
+            "upcoming_30_days": _scalar("""
+                SELECT COUNT(*) FROM tourism_events
+                WHERE status = 'approved'
+                  AND event_date >= CURRENT_DATE AND event_date < CURRENT_DATE + 30
+            """),
+            "past": _scalar("""
+                SELECT COUNT(*) FROM tourism_events
+                WHERE status = 'approved' AND event_date < CURRENT_DATE
+            """),
+            "pending": pending["events"],
+        }
 
+        # ---------------- stories ----------------
         stories = {
             "published": totals["stories_published"],
             "drafts": _scalar("SELECT COUNT(*) FROM blogs WHERE status <> 'published'"),
@@ -1914,9 +2051,80 @@ def admin_analytics():
                 FROM blogs WHERE status = 'published'
                 ORDER BY views DESC NULLS LAST LIMIT 5
             """),
+            # new
+            "by_category": _rows("""
+                SELECT COALESCE(c.name, 'Uncategorised') AS label, COUNT(b.id) AS value
+                FROM blogs b LEFT JOIN blog_categories c ON c.id = b.category_id
+                WHERE b.status = 'published'
+                GROUP BY 1 ORDER BY value DESC
+            """),
+            "published_by_month": _rows("""
+                SELECT to_char(g.m, 'Mon') AS label, COUNT(b.id) AS value
+                FROM generate_series(
+                    date_trunc('month', CURRENT_DATE) - interval '5 months',
+                    date_trunc('month', CURRENT_DATE),
+                    interval '1 month'
+                ) AS g(m)
+                LEFT JOIN blogs b
+                       ON date_trunc('month', b.published_at) = g.m
+                      AND b.status = 'published'
+                GROUP BY g.m ORDER BY g.m
+            """),
+        }
+
+        # ---------------- gaps: concrete things to fix ----------------
+        villages_without_page = _rows("""
+            SELECT l.village_name AS village,
+                   COALESCE(NULLIF(l.taluka_name, ''), 'Unknown') AS taluka,
+                   COUNT(*) AS places
+            FROM locations l
+            LEFT JOIN village_explore v
+                   ON lower(trim(v.village_name)) = lower(trim(l.village_name))
+                  AND lower(trim(v.taluka_name)) = lower(trim(l.taluka_name))
+                  AND v.status = 'published'
+            WHERE COALESCE(trim(l.village_name), '') <> '' AND v.id IS NULL
+            GROUP BY l.village_name, l.taluka_name
+            ORDER BY places DESC, village
+        """)
+        villages_total = _scalar("""
+            SELECT COUNT(*) FROM (
+                SELECT DISTINCT lower(trim(village_name)), lower(trim(taluka_name))
+                FROM locations WHERE COALESCE(trim(village_name), '') <> ''
+            ) x
+        """)
+
+        gaps = {
+            "villages_total": villages_total,
+            "villages_without_page": len(villages_without_page),
+            "villages_without_page_list": villages_without_page[:10],
+            "locations_without_photos": _rows("""
+                SELECT location_name AS label,
+                       COALESCE(NULLIF(taluka_name, ''), 'Unknown') AS area
+                FROM locations
+                WHERE COALESCE(site_photos::text, '') IN ('', '{}', '[]')
+                ORDER BY location_name LIMIT 10
+            """),
+            "locations_without_coordinates": _rows("""
+                SELECT location_name AS label,
+                       COALESCE(NULLIF(taluka_name, ''), 'Unknown') AS area
+                FROM locations
+                WHERE latitude IS NULL OR longitude IS NULL
+                ORDER BY location_name LIMIT 10
+            """),
+            "homestays_without_digital_payment": _rows("""
+                SELECT homestay_name AS label,
+                       COALESCE(NULLIF(taluka_name, ''), 'Unknown') AS area
+                FROM homestays
+                WHERE NOT (digital_payments_upi::text ILIKE 'y%'
+                           OR digital_payments_upi::text ILIKE '%upi%')
+                   OR digital_payments_upi IS NULL
+                ORDER BY homestay_name LIMIT 10
+            """),
         }
 
         return jsonify({
+            "generated_at": datetime.utcnow().isoformat() + "Z",
+            # existing keys (unchanged)
             "totals": totals,
             "pending": pending,
             "locations_by_taluka": locations_by_taluka,
@@ -1929,6 +2137,22 @@ def admin_analytics():
             "events_by_month": events_by_month,
             "events_by_category": events_by_category,
             "stories": stories,
+            # new keys
+            "pending_age": pending_age,
+            "locations_by_village": locations_by_village,
+            "location_facilities": location_facilities,
+            "locations_by_crowd": locations_by_crowd,
+            "locations_by_season": locations_by_season,
+            "homestay_facilities": homestay_facilities,
+            "drivers_by_taluka": drivers_by_taluka,
+            "drivers_by_vehicle": drivers_by_vehicle,
+            "bus_stops_by_taluka": bus_stops_by_taluka,
+            "atms": atms,
+            "health_services": health_services,
+            "content": content,
+            "hidden_paths": hidden_paths,
+            "events_summary": events_summary,
+            "gaps": gaps,
         }), 200
 
     except Exception as e:
@@ -2208,10 +2432,6 @@ def delete_atm(id):
 
 # ==================================================================
 # Admin data manager: view / edit / delete / add live records
-#
-# PASTE THIS AT THE END OF YOUR ROUTES FILE (the one that defines `bp`,
-# `_rows` and `_resolve_coordinates`). It needs no new imports beyond the
-# ones that file already has (json, text, db, request, jsonify).
 #
 # Table names come from the fixed ADMIN_TABLES list and column names are
 # checked against the real table columns, so nothing from the request is
@@ -2819,10 +3039,6 @@ def admin_delete_hidden_path(path_id):
 # ==================================================================
 # Local Experiences (Guided Walks / Konkani Food / Community Interaction)
 # Requires experiences.sql to have been run on the database first.
-#
-# PASTE THIS AT THE VERY END of your routes file (the one that defines `bp`).
-# It needs no new imports: it uses json, text, db, request, jsonify and
-# unique_slug(), which that file already has.
 # Photos are uploaded through your existing POST /api/upload-photo (Cloudinary).
 # ==================================================================
 
@@ -2994,13 +3210,10 @@ def admin_delete_experience(id):
         db.session.rollback()
         return jsonify({"success": False, "error": str(e)}), 500
 
+
 # ==================================================================
 # Explore Villages
 # Requires explore_villages.sql to have been run on the database first.
-#
-# PASTE THIS AT THE VERY END of your routes file (the one that defines `bp`).
-# It needs no new imports: it uses json, text, db, request, jsonify,
-# _rows, _clean, _public_rows and admin_required, which that file already has.
 # Photos are uploaded through your existing POST /api/upload-photo (Cloudinary).
 # ==================================================================
 
@@ -3334,13 +3547,11 @@ def admin_delete_explore_village(id):
     except Exception as e:
         db.session.rollback()
         return jsonify({"success": False, "error": str(e)}), 500
+
+
 # ==================================================================
 # Itineraries
 # Requires itineraries.sql to have been run on the database first.
-#
-# PASTE THIS AT THE VERY END of your routes file (the one that defines `bp`).
-# It needs no new imports: it uses json, text, db, request, jsonify,
-# _rows, _clean, unique_slug and admin_required, which that file already has.
 # Photos are uploaded through your existing POST /api/upload-photo (Cloudinary).
 # ==================================================================
 
@@ -3642,13 +3853,10 @@ def admin_delete_itinerary(id):
         db.session.rollback()
         return jsonify({"success": False, "error": str(e)}), 500
 
+
 # ==================================================================
 # Circuits
 # Requires circuits.sql to have been run on the database first.
-#
-# PASTE THIS AT THE VERY END of your routes file (the one that defines `bp`).
-# It needs no new imports: it uses json, text, db, request, jsonify,
-# _rows, _clean, unique_slug and admin_required, which that file already has.
 # Photos are uploaded through your existing POST /api/upload-photo (Cloudinary).
 # ==================================================================
 
