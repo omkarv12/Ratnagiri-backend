@@ -4152,3 +4152,78 @@ def admin_delete_circuit(id):
     except Exception as e:
         db.session.rollback()
         return jsonify({"success": False, "error": str(e)}), 500
+
+    # ==================================================================
+# "How did you hear about us?" survey
+# Requires survey_responses.sql to have been run on the database first.
+# ==================================================================
+
+SURVEY_SOURCES = {
+    "google", "youtube", "instagram", "facebook", "x", "whatsapp", "linkedin",
+    "telegram", "reddit", "pinterest", "snapchat", "quora", "wikipedia", "bing",
+    "ai", "friend", "news", "blog", "tourism-office", "other", "skipped",
+}
+
+
+@bp.route('/api/survey/how-found', methods=['POST'])
+def submit_how_found():
+    try:
+        data = request.get_json(silent=True) or {}
+
+        source = str(data.get("source") or "").strip()
+        if source not in SURVEY_SOURCES:
+            return jsonify({"success": False, "error": "Invalid source."}), 400
+
+        other_text = None
+        if source == "other":
+            other_text = _clean(data.get("other"), 80) or None
+
+        db.session.execute(text("""
+            INSERT INTO survey_responses (source, other_text, user_agent)
+            VALUES (:source, :other_text, :user_agent)
+        """), {
+            "source": source,
+            "other_text": other_text,
+            "user_agent": (request.headers.get("User-Agent") or "")[:500] or None,
+        })
+        db.session.commit()
+
+        return jsonify({"success": True}), 201
+
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@bp.route('/api/admin/survey/how-found', methods=['GET'])
+@admin_required
+def admin_survey_how_found():
+    """Counts per source, what people typed under 'Other', responses per day."""
+    try:
+        return jsonify({
+            "total": _scalar("SELECT COUNT(*) FROM survey_responses"),
+            "answered": _scalar(
+                "SELECT COUNT(*) FROM survey_responses WHERE source <> 'skipped'"),
+            "skipped": _scalar(
+                "SELECT COUNT(*) FROM survey_responses WHERE source = 'skipped'"),
+            "by_source": _rows("""
+                SELECT source AS label, COUNT(*) AS value
+                FROM survey_responses
+                WHERE source <> 'skipped'
+                GROUP BY source ORDER BY value DESC
+            """),
+            "other_answers": _rows("""
+                SELECT other_text AS label, COUNT(*) AS value
+                FROM survey_responses
+                WHERE source = 'other' AND COALESCE(other_text, '') <> ''
+                GROUP BY other_text ORDER BY value DESC LIMIT 50
+            """),
+            "per_day": _rows("""
+                SELECT created_at::date::text AS label, COUNT(*) AS value
+                FROM survey_responses
+                WHERE created_at >= NOW() - interval '30 days'
+                GROUP BY 1 ORDER BY 1
+            """),
+        }), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
