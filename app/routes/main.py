@@ -4227,3 +4227,599 @@ def admin_survey_how_found():
         }), 200
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
+# ==================================================================
+# CHATBOT  (paste at the very END of main.py)
+#
+# Also add  `import time`  to the imports at the top of main.py.
+# Optional: pip install anthropic  +  set ANTHROPIC_API_KEY for natural AI answers.
+# Optional: set CHATBOT_ADMIN_TOKEN to protect the /api/admin/chatbot/* routes.
+# Creates its own tables (chatbot_knowledge, chatbot_unanswered) on the first request.
+# ==================================================================
+
+try:
+    import anthropic
+
+    _ai = anthropic.Anthropic() if os.environ.get("ANTHROPIC_API_KEY") else None
+except Exception:  # package not installed -> database-only mode
+    _ai = None
+
+AI_MODEL = "claude-sonnet-5-5"
+
+
+# ==================================================================
+# Own tables (created on first request) + starter FAQ entries
+# ==================================================================
+
+_ready = False
+
+_SEED = [
+    ("visit", "Best time to visit Ratnagiri",
+     "October to February is the most comfortable time: cool and dry, good for beaches and sightseeing. June to September is the monsoon, with green hills and waterfalls, but sea activities are usually restricted. April and May are hot, but it is Alphonso mango season.",
+     "best time season weather monsoon winter summer when climate", None),
+    ("travel", "How to reach Ratnagiri",
+     "Ratnagiri is on the Konkan Railway line and the Mumbai-Goa highway (NH66) runs through the district. Mumbai and Pune are each roughly a 6 to 8 hour drive. Check train timings and road works before you travel.",
+     "reach train railway road bus airport mumbai pune distance highway", None),
+    ("rules", "Rules for tourists",
+     "Respect local culture, traditions and religious places. Do not litter. Follow safety guidelines at beaches, forts, waterfalls and trekking routes. Do not damage monuments or heritage sites. Carry a valid ID. Dress appropriately at temples. Do not disturb or feed wildlife. Support local communities. Follow traffic rules. Practise responsible tourism.",
+     "rules tourists guidelines dos donts litter dress safety behaviour", "/resources/dos-and-donts"),
+    ("safety", "Emergency numbers",
+     "In an emergency call 112. Police: 100. Ambulance: 108.",
+     "emergency police ambulance helpline 112 100 108 help", None),
+    ("food", "Alphonso mangoes",
+     "Ratnagiri is famous for Alphonso (Hapus) mangoes. The season runs roughly April to May. Buy from trusted sellers or orchards and ask about the harvest date.",
+     "mango alphonso hapus aamras season orchard", None),
+    ("culture", "Festivals on the Konkan coast",
+     "Ganesh Chaturthi and Shimga (Holi) are among the biggest festivals, celebrated at village level with processions and traditional songs. Check dates each year.",
+     "festival ganesh chaturthi shimga holi culture celebration", "/experiences/upcoming-events"),
+    ("site", "Interactive Map",
+     "The Interactive Map shows places, homestays, ATMs, bus stops and drivers around Ratnagiri.",
+     "map location nearby where interactive", "/map"),
+    ("site", "Contribute a place or service",
+     "Local businesses and residents can add a location, homestay, driver, event or hidden path through the Contribute form on this website. Submissions are reviewed before they are published.",
+     "contribute register add list business service provider submit", "/registration"),
+]
+
+
+@bp.before_app_request
+def _ensure_tables():
+    global _ready
+    if _ready:
+        return
+    _ready = True
+    try:
+        db.session.execute(text("""
+            CREATE TABLE IF NOT EXISTS chatbot_knowledge (
+                id SERIAL PRIMARY KEY,
+                category TEXT NOT NULL DEFAULT 'general',
+                title TEXT NOT NULL,
+                content TEXT NOT NULL,
+                keywords TEXT NOT NULL DEFAULT '',
+                route TEXT,
+                is_active BOOLEAN NOT NULL DEFAULT TRUE,
+                created_at TIMESTAMP DEFAULT NOW()
+            )
+        """))
+        db.session.execute(text("""
+            CREATE TABLE IF NOT EXISTS chatbot_unanswered (
+                id SERIAL PRIMARY KEY,
+                question TEXT NOT NULL,
+                asked_at TIMESTAMP DEFAULT NOW()
+            )
+        """))
+        if db.session.execute(text("SELECT COUNT(*) FROM chatbot_knowledge")).scalar() == 0:
+            for category, title, content, keywords, route in _SEED:
+                db.session.execute(text("""
+                    INSERT INTO chatbot_knowledge (category, title, content, keywords, route)
+                    VALUES (:c, :t, :b, :k, :r)
+                """), {"c": category, "t": title, "b": content, "k": keywords, "r": route})
+        db.session.commit()
+    except Exception as e:
+        db.session.rollback()
+        print("CHATBOT TABLE ERROR:", e)
+
+
+# ==================================================================
+# What the bot can search.
+# All SQL pieces below are fixed strings written in this file;
+# the visitor's words only ever travel as bound parameters.
+# ==================================================================
+
+SOURCES = {
+    "locations": {
+        "frm": "locations", "where": "TRUE", "order": "location_name",
+        "name": "location_name",
+        "cols": "location_name, village_name, taluka_name, attraction_type, nearest_landmark, "
+                "road_condition, seasonal_availability, avg_time_spent, entry_fee, entry_fee_amount, "
+                "visiting_hours, parking_space, food_stalls, nearest_bus_stand, "
+                "nearest_railway_station, site_activities",
+        "hay": "location_name, village_name, taluka_name, attraction_type, nearest_landmark, "
+               "site_activities, amenities_available, user_description",
+        "fields": [("Type", "attraction_type"), ("Village", "village_name"), ("Taluka", "taluka_name"),
+                   ("Landmark", "nearest_landmark"), ("Best season", "seasonal_availability"),
+                   ("Time needed", "avg_time_spent"), ("Entry fee", "entry_fee"),
+                   ("Fee amount", "entry_fee_amount"), ("Hours", "visiting_hours"),
+                   ("Parking", "parking_space"), ("Food stalls", "food_stalls"),
+                   ("Road", "road_condition"), ("Nearest bus stand", "nearest_bus_stand"),
+                   ("Nearest railway station", "nearest_railway_station"),
+                   ("Activities", "site_activities")],
+        "route": "/map", "label": "Open Interactive Map",
+    },
+    "homestays": {
+        "frm": "homestays", "where": "TRUE", "order": "homestay_name",
+        "name": "homestay_name",
+        "cols": "homestay_name, village_town_city, taluka_name, homestay_type, room_type, price_range, "
+                "check_in_out_time, facilities_services, veg_meals, local_experiences, "
+                "tourist_attractions, digital_payments_upi, phone_number",
+        "hay": "homestay_name, village_town_city, taluka_name, homestay_type, room_type, "
+               "facilities_services, local_experiences, tourist_attractions",
+        "fields": [("Type", "homestay_type"), ("Village", "village_town_city"), ("Taluka", "taluka_name"),
+                   ("Rooms", "room_type"), ("Price", "price_range"), ("Check-in/out", "check_in_out_time"),
+                   ("Facilities", "facilities_services"), ("Vegetarian meals", "veg_meals"),
+                   ("Experiences", "local_experiences"), ("Nearby", "tourist_attractions"),
+                   ("UPI", "digital_payments_upi"), ("Phone", "phone_number")],
+        "route": "/map", "label": "Open Interactive Map",
+    },
+    "village_explore": {
+        "frm": "village_explore", "where": "status = 'published'", "order": "village_name",
+        "name": "village_name",
+        "cols": "village_name, taluka_name, tagline, intro, how_to_reach, best_time, food, festivals, birds, flowers",
+        "hay": "village_name, taluka_name, tagline, intro, history, food, festivals, birds, flowers",
+        "fields": [("Taluka", "taluka_name"), ("Tagline", "tagline"), ("About", "intro"),
+                   ("Best time", "best_time"), ("How to reach", "how_to_reach"), ("Food", "food"),
+                   ("Festivals", "festivals"), ("Birds", "birds"), ("Flowers", "flowers")],
+        "route": None,
+    },
+    "village_profiles": {
+        "frm": "village_profiles", "where": "TRUE", "order": "village_name",
+        "name": "village_name",
+        "cols": "village_name, taluka_name, tagline, intro_text, best_time_to_visit, "
+                "how_to_reach_road, how_to_reach_rail, how_to_reach_air, stay_options_text",
+        "hay": "village_name, taluka_name, tagline, intro_text, about_text, stay_options_text",
+        "fields": [("Taluka", "taluka_name"), ("Tagline", "tagline"), ("About", "intro_text"),
+                   ("Best time", "best_time_to_visit"), ("By road", "how_to_reach_road"),
+                   ("By rail", "how_to_reach_rail"), ("By air", "how_to_reach_air"),
+                   ("Stay", "stay_options_text")],
+        "route": None,
+    },
+    "itineraries": {
+        "frm": "itineraries", "where": "status = 'published'", "order": "display_order, id",
+        "name": "title",
+        "cols": "title, tagline, theme, duration_days, best_season, budget_note, suited_for, "
+                "summary, start_point, end_point",
+        "hay": "title, tagline, theme, summary, suited_for, start_point, end_point",
+        "fields": [("Theme", "theme"), ("Days", "duration_days"), ("Best season", "best_season"),
+                   ("Budget", "budget_note"), ("Suited for", "suited_for"), ("Start", "start_point"),
+                   ("End", "end_point"), ("Summary", "summary")],
+        "route": "/experiences/itineraries", "label": "Open Itineraries",
+    },
+    "circuits": {
+        "frm": "circuits", "where": "status = 'published'", "order": "display_order, id",
+        "name": "title",
+        "cols": "title, tagline, theme, total_distance_km, duration_days, best_season, "
+                "start_point, end_point, summary",
+        "hay": "title, tagline, theme, summary, start_point, end_point",
+        "fields": [("Theme", "theme"), ("Distance km", "total_distance_km"), ("Days", "duration_days"),
+                   ("Best season", "best_season"), ("Start", "start_point"), ("End", "end_point"),
+                   ("Summary", "summary")],
+        "route": "/experiences/circuits", "label": "Open Circuits",
+    },
+    "tourism_events": {
+        "frm": "tourism_events", "where": "status = 'approved' AND event_date >= CURRENT_DATE",
+        "order": "event_date, id", "name": "title",
+        "cols": "title, event_date::text AS event_date, category, organizer_name, description",
+        "hay": "title, category, organizer_name, description",
+        "fields": [("Date", "event_date"), ("Type", "category"), ("Organiser", "organizer_name"),
+                   ("Details", "description")],
+        "route": "/experiences/upcoming-events", "label": "Open Upcoming Events",
+    },
+    "experiences": {
+        "frm": "experiences", "where": "status = 'published'", "order": "display_order, id",
+        "name": "title",
+        "cols": "title, category, summary, location, duration, price, season, contact, highlights",
+        "hay": "title, category, summary, description, location, highlights",
+        "fields": [("Summary", "summary"), ("Where", "location"), ("Duration", "duration"),
+                   ("Price", "price"), ("Season", "season"), ("Highlights", "highlights"),
+                   ("Contact", "contact")],
+        "route": None,
+    },
+    "blogs": {
+        "frm": "blogs", "where": "status = 'published'", "order": "published_at DESC NULLS LAST",
+        "name": "title",
+        "cols": "title, slug, excerpt, author_name",
+        "hay": "title, excerpt",
+        "fields": [("Author", "author_name"), ("About", "excerpt")],
+        "route": None,
+    },
+    "medical_facilities": {
+        "frm": "medical_facilities", "where": "is_active", "order": "name",
+        "name": "name",
+        "cols": "name, category, specialty, area, taluka, address_line, phone_primary, "
+                "emergency_phone, is_24x7, emergency_available, ambulance_available",
+        "hay": "name, category, specialty, area, taluka, landmark",
+        "fields": [("Type", "category"), ("Specialty", "specialty"), ("Area", "area"),
+                   ("Taluka", "taluka"), ("Address", "address_line"), ("Phone", "phone_primary"),
+                   ("Emergency phone", "emergency_phone"), ("Open 24x7", "is_24x7"),
+                   ("Emergency care", "emergency_available"), ("Ambulance", "ambulance_available")],
+        "route": "/medical-facilities", "label": "Open Medical Facilities",
+    },
+    "police_stations": {
+        "frm": "police_stations", "where": "is_active", "order": "name",
+        "name": "name",
+        "cols": "name, category, area, taluka, address_line, phone_primary, emergency_phone, "
+                "is_24x7, tourist_help",
+        "hay": "name, category, area, taluka, jurisdiction",
+        "fields": [("Type", "category"), ("Area", "area"), ("Taluka", "taluka"),
+                   ("Address", "address_line"), ("Phone", "phone_primary"),
+                   ("Emergency phone", "emergency_phone"), ("Open 24x7", "is_24x7"),
+                   ("Tourist help", "tourist_help")],
+        "route": "/police-stations", "label": "Open Police Stations",
+    },
+    "atms": {
+        "frm": "atms", "where": "TRUE", "order": "bank_name, atm_name",
+        "name": "atm_name",
+        "cols": "atm_name, bank_name, village_name, taluka_name, address, is_24x7, has_cash_deposit",
+        "hay": "atm_name, bank_name, village_name, taluka_name, address",
+        "fields": [("Bank", "bank_name"), ("Village", "village_name"), ("Taluka", "taluka_name"),
+                   ("Address", "address"), ("Open 24x7", "is_24x7"), ("Cash deposit", "has_cash_deposit")],
+        "route": "/map", "label": "Open Interactive Map",
+    },
+    "bus_stops": {
+        "frm": "bus_stops", "where": "TRUE", "order": "stop_name",
+        "name": "stop_name",
+        "cols": "stop_name, taluka_name",
+        "hay": "stop_name, taluka_name",
+        "fields": [("Taluka", "taluka_name")],
+        "route": "/map", "label": "Open Interactive Map",
+    },
+    "drivers": {
+        "frm": "drivers", "where": "TRUE", "order": "driver_name",
+        "name": "driver_name",
+        "cols": "driver_name, vehicle_type, base_village, taluka_name, service_area, "
+                "per_day_rate, phone_number",
+        "hay": "driver_name, vehicle_type, base_village, taluka_name, service_area",
+        "fields": [("Vehicle", "vehicle_type"), ("Based in", "base_village"), ("Taluka", "taluka_name"),
+                   ("Service area", "service_area"), ("Rate per day", "per_day_rate"),
+                   ("Phone", "phone_number")],
+        "route": "/map", "label": "Open Interactive Map",
+    },
+    "hidden_paths": {
+        "frm": "hidden_paths", "where": "status = 'approved'", "order": "created_at DESC",
+        "name": "title",
+        "cols": "title, path_type, difficulty, taluka, village, length_km, duration_min, "
+                "best_season, avoid_season, open_in_monsoon, safety_notes",
+        "hay": "title, path_type, taluka, village, how_to_reach",
+        "fields": [("Type", "path_type"), ("Difficulty", "difficulty"), ("Taluka", "taluka"),
+                   ("Village", "village"), ("Length km", "length_km"), ("Minutes", "duration_min"),
+                   ("Best season", "best_season"), ("Avoid", "avoid_season"),
+                   ("Open in monsoon", "open_in_monsoon"), ("Safety", "safety_notes")],
+        "route": None,
+    },
+    "chatbot_knowledge": {
+        "frm": "chatbot_knowledge", "where": "is_active", "order": "id",
+        "name": "title",
+        "cols": "title, content, route",
+        "hay": "title, content, keywords",
+        "fields": [("", "content")],
+        "route": None, "weight": 1.3,
+    },
+}
+
+# Question wording that should also pull rows from a table even when no word matches.
+INTENTS = [
+    (r"stay|hotel|homestay|room|accommodat|lodg|sleep", ["homestays"]),
+    (r"hospital|doctor|clinic|medical|pharmac|ambulance|blood|health", ["medical_facilities"]),
+    (r"police|crime|theft|complaint|\bfir\b", ["police_stations"]),
+    (r"\batm\b|cash|bank|money", ["atms"]),
+    (r"\bbus\b|bus stand|bus stop|msrtc", ["bus_stops"]),
+    (r"taxi|cab\b|driver|vehicle|\bcar\b|ride", ["drivers"]),
+    (r"event|festival|fair|program|upcoming|calendar|happening", ["tourism_events"]),
+    (r"itinerar|plan|days?\b|weekend|schedule", ["itineraries"]),
+    (r"circuit|route|loop", ["circuits"]),
+    (r"trek|hidden|secret|trail|hike|path", ["hidden_paths"]),
+    (r"stor(y|ies)|blog|read", ["blogs"]),
+    (r"walk|experience|community|food|eat|cuisine|dish|thali|seafood", ["experiences", "village_explore"]),
+]
+
+STOP = set("""
+the and for are was were with from that this have has had you your about what which who whom how
+when where why can could would should will tell please give show any some get find want need
+there their them they his her its our out not but all one two near nearby best good great top
+place places visit visiting ratnagiri maharashtra konkan trip info information details more
+also very much many like just into than then over under does did done been being let know
+""".split())
+
+SYNONYMS = {
+    "hotel": ["homestay"], "stay": ["homestay"], "lodging": ["homestay"], "accommodation": ["homestay"],
+    "doctor": ["hospital", "clinic"], "medicine": ["pharmacy"],
+    "taxi": ["driver"], "cab": ["driver"], "cash": ["atm"], "money": ["atm"],
+    "sea": ["beach"], "temple": ["temple"], "falls": ["waterfall"],
+}
+
+
+def _stem(t):
+    if len(t) > 4 and t.endswith("ies"):
+        return t[:-3] + "y"
+    if len(t) > 4 and re.search(r"(ch|sh|ss|x)es$", t):
+        return t[:-2]
+    if len(t) > 3 and t.endswith("s") and not t.endswith("ss"):
+        return t[:-1]
+    return t
+
+
+def _tokens(question):
+    out = []
+    for w in re.findall(r"[a-z0-9]{3,}", question.lower()):
+        if w in STOP:
+            continue
+        for t in [_stem(w)] + SYNONYMS.get(w, []):
+            if t not in out and t not in STOP:
+                out.append(t)
+    return out[:10]
+
+
+def _run(sql, params=None):
+    """A missing table or bad column must never break the chatbot."""
+    try:
+        return [dict(r) for r in db.session.execute(text(sql), params or {}).mappings().all()]
+    except Exception as e:
+        db.session.rollback()
+        print("CHATBOT SOURCE ERROR:", e)
+        return []
+
+
+def _val(v):
+    if v is None or v == "":
+        return ""
+    if isinstance(v, bool):
+        return "yes" if v else "no"
+    if isinstance(v, (list, tuple)):
+        parts = [str(i.get("name")) if isinstance(i, dict) else str(i) for i in v]
+        return ", ".join(p for p in parts if p and p != "None")[:200]
+    if isinstance(v, dict):
+        return ""
+    return " ".join(str(v).split())[:220]
+
+
+def _fact(key, src, row, score):
+    parts = []
+    for label, col in src["fields"]:
+        v = _val(row.get(col))
+        if v:
+            parts.append(f"{label}: {v}" if label else v)
+
+    title = row.get("_title") or ""
+    route, label = src.get("route"), src.get("label")
+    if key == "blogs" and row.get("slug"):
+        route, label = f"/stories/{row['slug']}", f"Read: {title}"
+    elif key == "experiences" and row.get("category"):
+        route, label = f"/experiences/{row['category']}", f"Open {title}"
+    elif key == "chatbot_knowledge":
+        route, label = row.get("route"), f"Open {title}"
+
+    return {"source": key, "title": title, "text": "; ".join(parts),
+            "route": route, "label": label, "score": score}
+
+
+def _gather(question, prev_question=""):
+    tokens = _tokens(question)
+    if len(tokens) < 2 and prev_question:        # short follow-up: "and how far is it?"
+        tokens = (tokens + [t for t in _tokens(prev_question) if t not in tokens])[:10]
+
+    q = (question + " " + prev_question).lower()
+    wanted = {k for pattern, keys in INTENTS if re.search(pattern, q) for k in keys}
+    pats = [f"%{t}%" for t in tokens]
+
+    facts = []
+    for key, s in SOURCES.items():
+        hay = f"lower(concat_ws(' ', {s['hay']}))"
+        base = (f"SELECT {s['cols']}, {s['name']}::text AS _title, {hay} AS _hay "
+                f"FROM {s['frm']} WHERE {s['where']}")
+
+        scored = []
+        if pats:
+            for r in _run(f"{base} AND {hay} ILIKE ANY(:pats) ORDER BY {s['order']} LIMIT 60",
+                          {"pats": pats}):
+                title, body = (r["_title"] or "").lower(), r["_hay"] or ""
+                score = sum((3 if t in title else 0) + (1 if t in body else 0) for t in tokens)
+                score = score * s.get("weight", 1) + (2 if key in wanted else 0)
+                scored.append(_fact(key, s, r, score))
+
+        scored.sort(key=lambda f: -f["score"])
+        scored = scored[:3]
+
+        # The question is about this kind of thing but no word matched: show a few anyway.
+        if key in wanted and len(scored) < 2:
+            seen = {f["title"] for f in scored}
+            for r in _run(f"{base} ORDER BY {s['order']} LIMIT 3"):
+                if (r["_title"] or "") not in seen and len(scored) < 3:
+                    scored.append(_fact(key, s, r, 0.5))
+
+        facts.extend(scored)
+
+    facts = [f for f in facts if f["score"] > 0]
+    facts.sort(key=lambda f: -f["score"])
+    return facts[:8]
+
+
+# ==================================================================
+# Chat endpoint
+# ==================================================================
+
+SYSTEM = """You are the Visit Ratnagiri guide on the Ratnagiri district (Maharashtra) tourism website.
+Answer ONLY from the CONTEXT below, which comes from the website's own database. If the context does not contain the answer, say you don't have that information yet and suggest the official MTDC website or local authorities. Never invent prices, timings, phone numbers, distances or availability.
+Be warm, practical and short (under 120 words). Plain text only, no markdown. When useful, name the exact place, village or taluka. Reply in the user's language."""
+
+_hits = {}          # ip -> recent request times (per server process)
+RATE_PER_MINUTE = 20
+
+
+def _plain_reply(facts):
+    if not facts:
+        return ("I don't have that information yet. Try asking about places to visit, homestays, "
+                "events, itineraries, hospitals, ATMs or getting around, or check the official MTDC website.")
+    if facts[0]["source"] == "chatbot_knowledge":
+        return facts[0]["text"]
+    lines = [f"{f['title']}: {f['text']}" if f["text"] else f["title"] for f in facts[:4]]
+    return "Here's what I found:\n\n" + "\n\n".join(lines)
+
+
+@bp.route("/api/chat", methods=["POST"])
+def chat():
+    now = time.time()
+    ip = request.headers.get("X-Forwarded-For", request.remote_addr or "?").split(",")[0].strip()
+    recent = [t for t in _hits.get(ip, []) if now - t < 60]
+    if len(recent) >= RATE_PER_MINUTE:
+        return jsonify({"error": "Too many requests. Please wait a moment."}), 429
+    _hits[ip] = recent + [now]
+
+    data = request.get_json(silent=True) or {}
+    messages = []
+    for m in (data.get("messages") or [])[-12:]:
+        if isinstance(m, dict) and m.get("role") in ("user", "assistant") and isinstance(m.get("content"), str):
+            messages.append({"role": m["role"], "content": m["content"][:1000]})
+    if not messages or messages[0]["role"] != "user":
+        return jsonify({"error": "Invalid messages."}), 400
+
+    users = [m["content"] for m in messages if m["role"] == "user"]
+    question = users[-1]
+    previous = users[-2] if len(users) > 1 else ""
+
+    facts = _gather(question, previous)
+
+    actions, seen = [], set()
+    for f in facts:
+        if f["route"] and f["route"] not in seen and len(actions) < 2:
+            seen.add(f["route"])
+            actions.append({"label": f["label"] or f"Open {f['title']}", "route": f["route"]})
+
+    if not facts:
+        try:
+            db.session.execute(text("INSERT INTO chatbot_unanswered (question) VALUES (:q)"),
+                               {"q": question[:300]})
+            db.session.commit()
+        except Exception:
+            db.session.rollback()
+
+    reply = None
+    if _ai:
+        try:
+            context = "\n".join(
+                f"[{i + 1}] ({f['source']}) {f['title']}" + (f" - {f['text']}" if f["text"] else "")
+                for i, f in enumerate(facts)
+            ) or "(nothing found in the database)"
+            result = _ai.messages.create(
+                model=AI_MODEL,
+                max_tokens=500,
+                system=f"{SYSTEM}\n\nToday's date: {date.today().isoformat()}\n\nCONTEXT:\n{context}",
+                messages=messages,
+            )
+            reply = "".join(b.text for b in result.content if getattr(b, "type", "") == "text").strip()
+        except Exception as e:
+            print("CHATBOT AI ERROR:", e)
+
+    if not reply:
+        reply = _plain_reply(facts)
+
+    return jsonify({"reply": reply, "actions": actions}), 200
+
+
+# ==================================================================
+# Admin: manage FAQ entries and see what visitors asked that the bot could not answer
+# If CHATBOT_ADMIN_TOKEN is set, requests must send it in the X-Admin-Token header.
+# If it is not set these behave like your other admin routes (open) - TODO: protect.
+# ==================================================================
+
+def _admin(f):
+    @wraps(f)
+    def wrapper(*args, **kwargs):
+        token = os.environ.get("CHATBOT_ADMIN_TOKEN")
+        if token and request.headers.get("X-Admin-Token") != token:
+            return jsonify({"error": "Unauthorized"}), 401
+        return f(*args, **kwargs)
+    return wrapper
+
+
+def _kb_body(data):
+    title = (data.get("title") or "").strip()[:200]
+    content = (data.get("content") or "").strip()[:3000]
+    if not title or not content:
+        return None
+    return {
+        "category": (data.get("category") or "general").strip()[:40],
+        "title": title,
+        "content": content,
+        "keywords": (data.get("keywords") or "").strip()[:500],
+        "route": (data.get("route") or "").strip()[:200] or None,
+        "is_active": bool(data.get("is_active", True)),
+    }
+
+
+@bp.route("/api/admin/chatbot/knowledge", methods=["GET"])
+@_admin
+def kb_list():
+    return jsonify(_run("SELECT * FROM chatbot_knowledge ORDER BY id")), 200
+
+
+@bp.route("/api/admin/chatbot/knowledge", methods=["POST"])
+@_admin
+def kb_create():
+    body = _kb_body(request.get_json(silent=True) or {})
+    if not body:
+        return jsonify({"success": False, "error": "Title and content are required."}), 400
+    try:
+        new_id = db.session.execute(text("""
+            INSERT INTO chatbot_knowledge (category, title, content, keywords, route, is_active)
+            VALUES (:category, :title, :content, :keywords, :route, :is_active) RETURNING id
+        """), body).scalar()
+        db.session.commit()
+        return jsonify({"success": True, "id": new_id}), 201
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@bp.route("/api/admin/chatbot/knowledge/<int:id>", methods=["PUT"])
+@_admin
+def kb_update(id):
+    body = _kb_body(request.get_json(silent=True) or {})
+    if not body:
+        return jsonify({"success": False, "error": "Title and content are required."}), 400
+    try:
+        body["id"] = id
+        res = db.session.execute(text("""
+            UPDATE chatbot_knowledge SET category = :category, title = :title, content = :content,
+                keywords = :keywords, route = :route, is_active = :is_active
+            WHERE id = :id
+        """), body)
+        db.session.commit()
+        if res.rowcount == 0:
+            return jsonify({"success": False, "error": "Not found."}), 404
+        return jsonify({"success": True}), 200
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@bp.route("/api/admin/chatbot/knowledge/<int:id>", methods=["DELETE"])
+@_admin
+def kb_delete(id):
+    try:
+        res = db.session.execute(text("DELETE FROM chatbot_knowledge WHERE id = :id"), {"id": id})
+        db.session.commit()
+        if res.rowcount == 0:
+            return jsonify({"success": False, "error": "Not found."}), 404
+        return jsonify({"success": True}), 200
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@bp.route("/api/admin/chatbot/unanswered", methods=["GET"])
+@_admin
+def unanswered_list():
+    return jsonify(_run("""
+        SELECT question, COUNT(*) AS times, MAX(asked_at)::text AS last_asked
+        FROM chatbot_unanswered GROUP BY question
+        ORDER BY times DESC, last_asked DESC LIMIT 100
+    """)), 200
