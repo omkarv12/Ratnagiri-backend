@@ -4823,3 +4823,221 @@ def unanswered_list():
         FROM chatbot_unanswered GROUP BY question
         ORDER BY times DESC, last_asked DESC LIMIT 100
     """)), 200
+
+# ==================================================================
+# Reel Awards
+# Requires the `reels` table (see reels.sql) and ADMIN_TOKEN env var.
+# ==================================================================
+
+REEL_AWARDS = {
+    "Best reel of the year", "Best food reel", "Best fort and coast reel",
+    "Best village story", "Best homestay reel",
+}
+_REEL_YT_RE = re.compile(r"(?:youtube\.com/shorts/|youtu\.be/|youtube\.com/watch\?(?:.*&)?v=)([\w-]{11})", re.I)
+_REEL_IG_RE = re.compile(r"instagram\.com/(?:reel|reels|p)/([\w-]+)", re.I)
+_REEL_STATUSES = ("pending", "approved", "rejected")
+
+
+def _reels_admin(f):
+    @wraps(f)
+    def wrapper(*args, **kwargs):
+        expected = os.environ.get("ADMIN_TOKEN", "")
+        sent = request.headers.get("Authorization", "").removeprefix("Bearer ").strip()
+        if not expected or not hmac.compare_digest(sent, expected):
+            return jsonify({"error": "Unauthorized"}), 401
+        return f(*args, **kwargs)
+    return wrapper
+
+
+def _parse_reel_link(url):
+    m = _REEL_YT_RE.search(url)
+    if m:
+        return "youtube", m.group(1)
+    m = _REEL_IG_RE.search(url)
+    if m:
+        return "instagram", m.group(1)
+    return None, None
+
+
+def _refresh_youtube_likes(only_ids=None):
+    """Store likeCount for approved YouTube reels (skips likes typed in by hand)."""
+    key = os.environ.get("YOUTUBE_API_KEY", "")
+    if not key:
+        return 0
+    if only_ids is None:
+        rows = _rows("""SELECT id, video_id FROM reels
+                        WHERE status='approved' AND platform='youtube' AND likes_source='auto'""")
+    else:
+        rows = _rows("""SELECT id, video_id FROM reels
+                        WHERE id = ANY(:ids) AND platform='youtube' AND likes_source='auto'""",
+                     {"ids": list(only_ids)})
+    updated = 0
+    for i in range(0, len(rows), 50):          # API accepts 50 ids per call
+        chunk = rows[i:i + 50]
+        resp = http_requests.get(
+            "https://www.googleapis.com/youtube/v3/videos",
+            params={"part": "statistics", "id": ",".join(r["video_id"] for r in chunk), "key": key},
+            timeout=10,
+        )
+        resp.raise_for_status()
+        likes = {it["id"]: it.get("statistics", {}).get("likeCount") for it in resp.json().get("items", [])}
+        for r in chunk:
+            n = likes.get(r["video_id"])
+            if n is None:                       # removed/private/hidden count
+                continue
+            db.session.execute(
+                text("UPDATE reels SET likes=:n, likes_updated_at=NOW() WHERE id=:id"),
+                {"n": int(n), "id": r["id"]})
+            updated += 1
+    db.session.commit()
+    return updated
+
+
+# ---------------- Public ----------------
+
+@bp.route('/api/reels', methods=['GET'])
+def list_reels():
+    """Approved reels, most liked first. Email/phone are never returned."""
+    try:
+        stale = _scalar("""
+            SELECT COUNT(*) FROM reels
+            WHERE status='approved' AND platform='youtube' AND likes_source='auto'
+              AND (likes_updated_at IS NULL OR likes_updated_at < NOW() - interval '1 hour')
+        """)
+        if stale:
+            try:
+                _refresh_youtube_likes()
+            except Exception as e:             # never break the page if YouTube is down
+                db.session.rollback()
+                print("REELS LIKES ERROR:", e)
+
+        rows = _rows("""
+            SELECT id, title, name AS creator, handle, place, platform, video_id,
+                   award, note, likes
+            FROM reels WHERE status = 'approved'
+            ORDER BY likes DESC, created_at DESC
+        """)
+        return jsonify(reels=rows), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@bp.route('/api/reels/submit', methods=['POST'])
+def submit_reel():
+    try:
+        d = request.get_json(silent=True) or {}
+        url = _clean(d.get("url") or d.get("link"), 500)
+        platform, video_id = _parse_reel_link(url)
+        name, email = _clean(d.get("name"), 120), _clean(d.get("email"), 160)
+        title, place = _clean(d.get("title"), 160), _clean(d.get("place"), 120)
+
+        if not (name and email and title and place):
+            return jsonify(error="Name, email, reel title and place are required."), 400
+        if not re.match(r"^[^@\s]+@[^@\s]+\.[^@\s]+$", email):
+            return jsonify(error="Please enter a valid email address."), 400
+        if not platform:
+            return jsonify(error="Please paste a YouTube Shorts or Instagram reel link."), 400
+        if not d.get("consent"):
+            return jsonify(error="Please confirm the consent box."), 400
+        category = d.get("category") if d.get("category") in REEL_AWARDS else None
+
+        if db.session.execute(
+            text("SELECT 1 FROM reels WHERE platform=:p AND video_id=:v"),
+            {"p": platform, "v": video_id}).first():
+            return jsonify(error="This reel has already been submitted."), 409
+
+        new_id = db.session.execute(text("""
+            INSERT INTO reels (name, handle, email, phone, title, place, category, url, platform, video_id)
+            VALUES (:name, :handle, :email, :phone, :title, :place, :category, :url, :platform, :video_id)
+            RETURNING id
+        """), {
+            "name": name, "handle": _clean(d.get("handle"), 80), "email": email,
+            "phone": _clean(d.get("phone"), 30), "title": title, "place": place,
+            "category": category, "url": url, "platform": platform, "video_id": video_id,
+        }).scalar()
+        db.session.commit()
+        return jsonify(ok=True, id=new_id), 201
+    except Exception as e:
+        db.session.rollback()
+        return jsonify(error=str(e)), 500
+
+
+# ---------------- Admin (Authorization: Bearer <ADMIN_TOKEN>) ----------------
+
+@bp.route('/api/reels/admin', methods=['GET'])
+@_reels_admin
+def admin_list_reels():
+    status = request.args.get("status", "pending")
+    if status not in _REEL_STATUSES:
+        return jsonify(error="Invalid status."), 400
+    return jsonify(reels=_rows(
+        "SELECT * FROM reels WHERE status=:s ORDER BY created_at DESC", {"s": status})), 200
+
+
+@bp.route('/api/reels/admin/<int:reel_id>', methods=['PATCH'])
+@_reels_admin
+def admin_update_reel(reel_id):
+    d = request.get_json(silent=True) or {}
+    sets, params = [], {"id": reel_id}
+
+    if "status" in d:
+        if d["status"] not in _REEL_STATUSES:
+            return jsonify(error="Invalid status."), 400
+        sets.append("status=:status"); params["status"] = d["status"]
+    if "award" in d:
+        if d["award"] is not None and d["award"] not in REEL_AWARDS:
+            return jsonify(error="Unknown award."), 400
+        sets.append("award=:award"); params["award"] = d["award"]
+    if "note" in d:
+        sets.append("note=:note"); params["note"] = _clean(d["note"], 300) or None
+    if "likes" in d:                            # manual like count (Instagram / override)
+        try:
+            n = int(d["likes"])
+        except (TypeError, ValueError):
+            return jsonify(error="Likes must be a whole number."), 400
+        if n < 0:
+            return jsonify(error="Likes cannot be negative."), 400
+        sets += ["likes=:likes", "likes_source='manual'", "likes_updated_at=NOW()"]
+        params["likes"] = n
+    if not sets:
+        return jsonify(error="Nothing to update."), 400
+
+    try:
+        res = db.session.execute(text(f"UPDATE reels SET {', '.join(sets)} WHERE id=:id"), params)
+        db.session.commit()
+        if res.rowcount == 0:
+            return jsonify(error="Reel not found."), 404
+        if d.get("status") == "approved":
+            try:
+                _refresh_youtube_likes([reel_id])   # starting like count right away
+            except Exception as e:
+                db.session.rollback()
+                print("REELS LIKES ERROR:", e)
+        return jsonify(ok=True), 200
+    except Exception as e:
+        db.session.rollback()
+        return jsonify(error=str(e)), 500
+
+
+@bp.route('/api/reels/admin/refresh-likes', methods=['POST'])
+@_reels_admin
+def admin_refresh_reel_likes():
+    if not os.environ.get("YOUTUBE_API_KEY"):
+        return jsonify(error="YOUTUBE_API_KEY is not set on the server."), 400
+    try:
+        return jsonify(ok=True, updated=_refresh_youtube_likes()), 200
+    except Exception as e:
+        db.session.rollback()
+        return jsonify(error=f"YouTube API error: {e}"), 502
+
+
+@bp.route('/api/reels/admin/<int:reel_id>', methods=['DELETE'])
+@_reels_admin
+def admin_delete_reel(reel_id):
+    try:
+        db.session.execute(text("DELETE FROM reels WHERE id=:id"), {"id": reel_id})
+        db.session.commit()
+        return jsonify(ok=True), 200
+    except Exception as e:
+        db.session.rollback()
+        return jsonify(error=str(e)), 500
