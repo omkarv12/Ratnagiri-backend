@@ -4839,14 +4839,7 @@ _REEL_STATUSES = ("pending", "approved", "rejected")
 
 
 def _reels_admin(f):
-    @wraps(f)
-    def wrapper(*args, **kwargs):
-        expected = os.environ.get("ADMIN_TOKEN", "")
-        sent = request.headers.get("Authorization", "").removeprefix("Bearer ").strip()
-        if not expected or not hmac.compare_digest(sent, expected):
-            return jsonify({"error": "Unauthorized"}), 401
-        return f(*args, **kwargs)
-    return wrapper
+      return admin_required(f)   # same open placeholder as your other admin routes
 
 
 def _parse_reel_link(url):
