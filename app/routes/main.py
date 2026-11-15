@@ -4825,8 +4825,11 @@ def unanswered_list():
     """)), 200
 
 # ==================================================================
-# Reel Awards
-# Requires the `reels` table (see reels.sql) and ADMIN_TOKEN env var.
+# Reel Awards (Reels + Videos)
+# Requires the `reels` table with the `kind` column ('reel' | 'video').
+# kind is set automatically from the link:
+#   YouTube Shorts and Instagram reels -> 'reel'
+#   regular YouTube videos             -> 'video'
 # ==================================================================
 
 REEL_AWARDS = {
@@ -4836,10 +4839,11 @@ REEL_AWARDS = {
 _REEL_YT_RE = re.compile(r"(?:youtube\.com/shorts/|youtu\.be/|youtube\.com/watch\?(?:.*&)?v=)([\w-]{11})", re.I)
 _REEL_IG_RE = re.compile(r"instagram\.com/(?:reel|reels|p)/([\w-]+)", re.I)
 _REEL_STATUSES = ("pending", "approved", "rejected")
+_REEL_KINDS = ("reel", "video")
 
 
 def _reels_admin(f):
-      return admin_required(f)   # same open placeholder as your other admin routes
+    return admin_required(f)   # same open placeholder as your other admin routes
 
 
 def _parse_reel_link(url):
@@ -4852,8 +4856,15 @@ def _parse_reel_link(url):
     return None, None
 
 
+def _reel_kind(url, platform):
+    """Shorts and Instagram reels are 'reel'; regular YouTube links are 'video'."""
+    if platform == "youtube" and "/shorts/" not in url.lower():
+        return "video"
+    return "reel"
+
+
 def _refresh_youtube_likes(only_ids=None):
-    """Store likeCount for approved YouTube reels (skips likes typed in by hand)."""
+    """Store likeCount for approved YouTube reels/videos (skips likes typed in by hand)."""
     key = os.environ.get("YOUTUBE_API_KEY", "")
     if not key:
         return 0
@@ -4890,7 +4901,11 @@ def _refresh_youtube_likes(only_ids=None):
 
 @bp.route('/api/reels', methods=['GET'])
 def list_reels():
-    """Approved reels, most liked first. Email/phone are never returned."""
+    """Approved reels or videos (?kind=reel|video, default reel), most liked first.
+    Email/phone are never returned."""
+    kind = request.args.get("kind", "reel")
+    if kind not in _REEL_KINDS:
+        kind = "reel"
     try:
         stale = _scalar("""
             SELECT COUNT(*) FROM reels
@@ -4907,9 +4922,9 @@ def list_reels():
         rows = _rows("""
             SELECT id, title, name AS creator, handle, place, platform, video_id,
                    award, note, likes
-            FROM reels WHERE status = 'approved'
+            FROM reels WHERE status = 'approved' AND kind = :k
             ORDER BY likes DESC, created_at DESC
-        """)
+        """, {"k": kind})
         return jsonify(reels=rows), 200
     except Exception as e:
         return jsonify({"error": str(e)}), 500
@@ -4925,28 +4940,32 @@ def submit_reel():
         title, place = _clean(d.get("title"), 160), _clean(d.get("place"), 120)
 
         if not (name and email and title and place):
-            return jsonify(error="Name, email, reel title and place are required."), 400
+            return jsonify(error="Name, email, title and place are required."), 400
         if not re.match(r"^[^@\s]+@[^@\s]+\.[^@\s]+$", email):
             return jsonify(error="Please enter a valid email address."), 400
         if not platform:
-            return jsonify(error="Please paste a YouTube Shorts or Instagram reel link."), 400
+            return jsonify(error="Please paste a YouTube or Instagram reel link."), 400
         if not d.get("consent"):
             return jsonify(error="Please confirm the consent box."), 400
-        category = d.get("category") if d.get("category") in REEL_AWARDS else None
+
+        kind = _reel_kind(url, platform)
+        # Award categories only apply to reels.
+        category = d.get("category") if kind == "reel" and d.get("category") in REEL_AWARDS else None
 
         if db.session.execute(
             text("SELECT 1 FROM reels WHERE platform=:p AND video_id=:v"),
             {"p": platform, "v": video_id}).first():
-            return jsonify(error="This reel has already been submitted."), 409
+            return jsonify(error="This link has already been submitted."), 409
 
         new_id = db.session.execute(text("""
-            INSERT INTO reels (name, handle, email, phone, title, place, category, url, platform, video_id)
-            VALUES (:name, :handle, :email, :phone, :title, :place, :category, :url, :platform, :video_id)
+            INSERT INTO reels (name, handle, email, phone, title, place, category, url, platform, video_id, kind)
+            VALUES (:name, :handle, :email, :phone, :title, :place, :category, :url, :platform, :video_id, :kind)
             RETURNING id
         """), {
             "name": name, "handle": _clean(d.get("handle"), 80), "email": email,
             "phone": _clean(d.get("phone"), 30), "title": title, "place": place,
             "category": category, "url": url, "platform": platform, "video_id": video_id,
+            "kind": kind,
         }).scalar()
         db.session.commit()
         return jsonify(ok=True, id=new_id), 201
@@ -4955,16 +4974,23 @@ def submit_reel():
         return jsonify(error=str(e)), 500
 
 
-# ---------------- Admin (Authorization: Bearer <ADMIN_TOKEN>) ----------------
+# ---------------- Admin (same open placeholder as your other admin routes) ----------------
 
 @bp.route('/api/reels/admin', methods=['GET'])
 @_reels_admin
 def admin_list_reels():
     status = request.args.get("status", "pending")
+    kind = request.args.get("kind", "reel")
     if status not in _REEL_STATUSES:
         return jsonify(error="Invalid status."), 400
-    return jsonify(reels=_rows(
-        "SELECT * FROM reels WHERE status=:s ORDER BY created_at DESC", {"s": status})), 200
+    if kind not in _REEL_KINDS:
+        return jsonify(error="Invalid kind."), 400
+    rows = _rows(
+        "SELECT * FROM reels WHERE status=:s AND kind=:k ORDER BY created_at DESC",
+        {"s": status, "k": kind})
+    counts = {f"{r['kind']}_{r['status']}": r["n"] for r in _rows(
+        "SELECT kind, status, COUNT(*) AS n FROM reels GROUP BY kind, status")}
+    return jsonify(reels=rows, counts=counts), 200
 
 
 @bp.route('/api/reels/admin/<int:reel_id>', methods=['PATCH'])
