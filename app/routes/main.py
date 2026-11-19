@@ -3039,8 +3039,15 @@ def admin_delete_hidden_path(path_id):
 
 # ==================================================================
 # Local Experiences (Guided Walks / Konkani Food / Community Interaction)
-# Requires experiences.sql to have been run on the database first.
+# Requires experiences.sql to have been run on the database first, plus:
+#
+#   ALTER TABLE experiences
+#     ADD COLUMN IF NOT EXISTS images jsonb NOT NULL DEFAULT '[]'::jsonb;
+#   UPDATE experiences SET images = jsonb_build_array(image_url)
+#     WHERE COALESCE(image_url, '') <> '' AND images = '[]'::jsonb;
+#
 # Photos are uploaded through your existing POST /api/upload-photo (Cloudinary).
+# The first photo in `images` is the cover and is also saved in `image_url`.
 # ==================================================================
 
 EXPERIENCE_CATEGORIES = {"guided-walks", "konkani-food", "community-interaction"}
@@ -3049,7 +3056,7 @@ _EXP_TEXT_FIELDS = (
     "location", "duration", "price", "season", "contact",
 )
 _EXP_SELECT = """
-    SELECT id, category, title, slug, summary, description, image_url,
+    SELECT id, category, title, slug, summary, description, image_url, images,
            location, duration, price, season, highlights, contact,
            display_order, status, updated_at::text AS updated_at
     FROM experiences
@@ -3067,6 +3074,14 @@ def _exp_values(data):
         [str(h).strip() for h in highlights if str(h).strip()]
     )
 
+    images = data.get("images") or []
+    if isinstance(images, str):
+        images = images.split("\n")
+    images = [str(u).strip() for u in images if str(u).strip()][:12]
+    values["images"] = json.dumps(images)
+    if images:
+        values["image_url"] = images[0]   # cover stays in sync
+
     try:
         values["display_order"] = int(data.get("display_order") or 0)
     except (TypeError, ValueError):
@@ -3078,9 +3093,11 @@ def _exp_values(data):
 
 
 def _exp_image_problem(values):
-    url = values["image_url"]
-    if url and not url.startswith("https://"):
-        return "Photo URL must start with https://"
+    urls = json.loads(values["images"])
+    if values["image_url"]:
+        urls.append(values["image_url"])
+    if any(not u.startswith("https://") for u in urls):
+        return "Photo URLs must start with https://"
     return None
 
 
@@ -3143,11 +3160,12 @@ def admin_create_experience():
 
         row = db.session.execute(text("""
             INSERT INTO experiences (
-                category, title, slug, summary, description, image_url,
+                category, title, slug, summary, description, image_url, images,
                 location, duration, price, season, highlights, contact,
                 display_order, status
             ) VALUES (
                 :category, :title, :slug, :summary, :description, :image_url,
+                CAST(:images AS jsonb),
                 :location, :duration, :price, :season,
                 CAST(:highlights AS jsonb), :contact,
                 :display_order, :status
@@ -3179,7 +3197,8 @@ def admin_update_experience(id):
         result = db.session.execute(text("""
             UPDATE experiences SET
                 title = :title, summary = :summary, description = :description,
-                image_url = :image_url, location = :location, duration = :duration,
+                image_url = :image_url, images = CAST(:images AS jsonb),
+                location = :location, duration = :duration,
                 price = :price, season = :season,
                 highlights = CAST(:highlights AS jsonb), contact = :contact,
                 display_order = :display_order, status = :status,
@@ -3210,7 +3229,6 @@ def admin_delete_experience(id):
     except Exception as e:
         db.session.rollback()
         return jsonify({"success": False, "error": str(e)}), 500
-
 
 # ==================================================================
 # Explore Villages
