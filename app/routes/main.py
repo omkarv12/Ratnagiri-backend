@@ -104,7 +104,8 @@ def list_events():
     try:
         result = db.session.execute(text("""
             SELECT id, title, event_date::text AS event_date, category,
-                   organizer_name, description, photo_url
+       organizer_name, organizer_contact, address, event_link,
+       description, photo_url
             FROM tourism_events
             WHERE status = 'approved'
               AND event_date >= :start AND event_date < :end
@@ -126,7 +127,7 @@ def upcoming_events():
 
         result = db.session.execute(text("""
             SELECT id, title, event_date::text AS event_date, category,
-                   organizer_name, description, photo_url
+                   organizer_name, description, photo_url, organizer_contact, address, event_link
             FROM tourism_events
             WHERE status = 'approved' AND event_date >= CURRENT_DATE
             ORDER BY event_date, id
@@ -161,13 +162,18 @@ def contribute_event():
         if photo_url and not photo_url.startswith("https://"):
             return jsonify({"success": False, "error": "Invalid photo URL"}), 400
 
+        address = (data.get("address") or "").strip()[:300] or None
+        event_link = (data.get("event_link") or "").strip()[:500] or None
+        if event_link and not re.match(r"^https?://", event_link, re.I):
+            return jsonify({"success": False, "error": "Invalid event link"}), 400
+
         result = db.session.execute(text("""
             INSERT INTO tourism_events
                 (title, event_date, category, organizer_name,
-                 organizer_contact, organizer_email, description, photo_url)
+                 organizer_contact, organizer_email, address, event_link, description, photo_url)
             VALUES
                 (:title, :event_date, :category, :organizer_name,
-                 :organizer_contact, :organizer_email, :description, :photo_url)
+                 :organizer_contact, :organizer_email, :address, :event_link, :description, :photo_url)
             RETURNING id
         """), {
             "title": title[:200],
@@ -176,6 +182,8 @@ def contribute_event():
             "organizer_name": organizer_name[:150],
             "organizer_contact": organizer_contact[:20],
             "organizer_email": (data.get("organizer_email") or "").strip()[:150] or None,
+            "address": address,
+            "event_link": event_link,
             "description": (data.get("description") or "").strip() or None,
             "photo_url": photo_url,
         })
@@ -199,7 +207,7 @@ def admin_list_events():
         result = db.session.execute(text("""
             SELECT id, title, event_date::text AS event_date, category,
                    organizer_name, organizer_contact, organizer_email,
-                   description, photo_url, status, created_at
+                   description, photo_url, status, created_at, address, event_link
             FROM tourism_events
             WHERE (:status = 'all' OR status = :status)
             ORDER BY created_at DESC
