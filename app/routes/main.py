@@ -5090,15 +5090,23 @@ def admin_delete_reel(reel_id):
         db.session.rollback()
         return jsonify(error=str(e)), 500
 
-    # ===========================================================================
+# ===========================================================================
 # TOUR GUIDES  -> paste at the very END of main.py
 #
 # Needs the tables from database/guides.sql.
 # Uses things already defined in main.py: bp, db, text, request, jsonify, re,
 # _rows, _scalar, _clean, admin_required.
-# If you pasted the earlier SQLAlchemy-model version (class Guide / GuideEnquiry),
-# DELETE it first, otherwise Flask will complain about duplicate routes.
+# If you pasted an earlier version of this block (or the SQLAlchemy-model
+# version with class Guide / GuideEnquiry), DELETE it first, otherwise Flask
+# will complain about duplicate routes.
 # ===========================================================================
+
+import logging
+from datetime import date
+
+from sqlalchemy.exc import IntegrityError   # (skip this line if main.py already imports it)
+
+_g_log = logging.getLogger("guides")
 
 GUIDE_STATUSES = ("pending", "approved", "rejected")
 GUIDE_ENQUIRY_STATUSES = ("new", "forwarded", "closed")
@@ -5123,6 +5131,13 @@ _G_RATING_COLS = """
 """
 
 
+def _g_fail(exc):
+    """Log the real error on the server; send the visitor a generic message."""
+    db.session.rollback()
+    _g_log.exception("guides route failed: %s", exc)
+    return jsonify({"error": "Something went wrong. Please try again later."}), 500
+
+
 def _g_digits10(value):
     return re.sub(r"\D", "", str(value or ""))[-10:]
 
@@ -5139,6 +5154,20 @@ def _g_int(value, lo, hi, default=0):
         return max(lo, min(hi, int(value)))
     except (TypeError, ValueError):
         return default
+
+
+def _g_travel_date(value):
+    """Return (iso_date_or_None, error_or_None). Empty is fine; past dates are not."""
+    value = _clean(value, 20)
+    if not value:
+        return None, None
+    try:
+        d = date.fromisoformat(value)
+    except ValueError:
+        return None, "Enter a valid travel date."
+    if d < date.today():
+        return None, "Travel date cannot be in the past."
+    return d.isoformat(), None
 
 
 def _g_counts():
@@ -5170,7 +5199,7 @@ def guides_list():
         """)
         return jsonify(rows), 200
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        return _g_fail(e)
 
 
 @bp.route('/api/guides/<int:guide_id>', methods=['GET'])
@@ -5192,7 +5221,7 @@ def guides_detail(guide_id):
         """, {"id": guide_id})
         return jsonify(guide), 200
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        return _g_fail(e)
 
 
 @bp.route('/api/guides/register', methods=['POST'])
@@ -5243,9 +5272,12 @@ def guides_register():
         """), v)
         db.session.commit()
         return jsonify({"message": "Thank you! Your registration was submitted. It will appear on the Tour Guides page once the department approves it."}), 201
-    except Exception as e:
+    except IntegrityError:
+        # two submissions raced past the check above; the unique index caught it
         db.session.rollback()
-        return jsonify({"error": str(e)}), 500
+        return jsonify({"error": "A guide with this phone number is already registered or awaiting approval."}), 409
+    except Exception as e:
+        return _g_fail(e)
 
 
 @bp.route('/api/guide-enquiries', methods=['POST'])
@@ -5262,6 +5294,10 @@ def guides_create_enquiry():
             return jsonify({"error": "Enter a valid 10-digit phone number."}), 400
         if email and not _G_EMAIL_RE.match(email):
             return jsonify({"error": "Enter a valid email address."}), 400
+
+        travel_date, date_err = _g_travel_date(d.get("travel_date"))
+        if date_err:
+            return jsonify({"error": date_err}), 400
 
         guide_id = d.get("guide_id")
         if guide_id not in (None, ""):
@@ -5283,15 +5319,14 @@ def guides_create_enquiry():
             "guide_id": guide_id, "name": name, "phone": phone, "email": email,
             "destination": _clean(d.get("destination"), 200) or None,
             "language": _clean(d.get("language"), 60) or None,
-            "travel_date": _clean(d.get("travel_date"), 20) or None,
+            "travel_date": travel_date,
             "group_size": _g_int(group, 1, 200) if group not in (None, "") else None,
             "message": _clean(d.get("message"), 1500) or None,
         })
         db.session.commit()
         return jsonify({"message": "Request sent! The department will connect you with a guide soon."}), 201
     except Exception as e:
-        db.session.rollback()
-        return jsonify({"error": str(e)}), 500
+        return _g_fail(e)
 
 
 @bp.route('/api/guides/<int:guide_id>/reviews', methods=['POST'])
@@ -5343,9 +5378,11 @@ def guides_add_review(guide_id):
         msg = ("Thank you for your review!" if status == "approved"
                else "Thank you! Your review will appear after the department approves it.")
         return jsonify({"message": msg, "status": status}), 201
-    except Exception as e:
+    except IntegrityError:
         db.session.rollback()
-        return jsonify({"error": str(e)}), 500
+        return jsonify({"error": "You have already reviewed this guide with this phone number."}), 409
+    except Exception as e:
+        return _g_fail(e)
 
 
 # ------------------------------ admin routes --------------------------------
@@ -5367,7 +5404,7 @@ def guides_admin_list():
         """, {"status": status})
         return jsonify({"guides": rows, "counts": _g_counts()}), 200
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        return _g_fail(e)
 
 
 @bp.route('/api/admin/guides/<int:guide_id>/approve', methods=['POST'])
@@ -5387,9 +5424,12 @@ def guides_admin_approve(guide_id):
             return jsonify({"error": "Guide not found."}), 404
         db.session.commit()
         return jsonify({"message": f"{row['guide_name']} approved ({row['registration_no']})."}), 200
-    except Exception as e:
+    except IntegrityError:
+        # approving would put a second active registration on the same phone number
         db.session.rollback()
-        return jsonify({"error": str(e)}), 500
+        return jsonify({"error": "Another active guide already uses this phone number."}), 409
+    except Exception as e:
+        return _g_fail(e)
 
 
 @bp.route('/api/admin/guides/<int:guide_id>/reject', methods=['POST'])
@@ -5407,8 +5447,7 @@ def guides_admin_reject(guide_id):
         db.session.commit()
         return jsonify({"message": f"{row['guide_name']} rejected."}), 200
     except Exception as e:
-        db.session.rollback()
-        return jsonify({"error": str(e)}), 500
+        return _g_fail(e)
 
 
 @bp.route('/api/admin/guides/<int:guide_id>', methods=['DELETE'])
@@ -5422,8 +5461,7 @@ def guides_admin_delete(guide_id):
             return jsonify({"error": "Guide not found."}), 404
         return jsonify({"message": "Guide deleted."}), 200
     except Exception as e:
-        db.session.rollback()
-        return jsonify({"error": str(e)}), 500
+        return _g_fail(e)
 
 
 @bp.route('/api/admin/guide-enquiries', methods=['GET'])
@@ -5439,7 +5477,7 @@ def guides_admin_enquiries():
         """)
         return jsonify({"enquiries": rows}), 200
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        return _g_fail(e)
 
 
 @bp.route('/api/admin/guide-enquiries/<int:enquiry_id>/status', methods=['POST'])
@@ -5456,8 +5494,7 @@ def guides_admin_enquiry_status(enquiry_id):
             return jsonify({"error": "Request not found."}), 404
         return jsonify({"message": "Updated."}), 200
     except Exception as e:
-        db.session.rollback()
-        return jsonify({"error": str(e)}), 500
+        return _g_fail(e)
 
 
 @bp.route('/api/admin/guide-reviews', methods=['GET'])
@@ -5474,7 +5511,7 @@ def guides_admin_reviews():
         """, {"status": status})
         return jsonify({"reviews": rows, "counts": _g_review_counts()}), 200
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        return _g_fail(e)
 
 
 @bp.route('/api/admin/guide-reviews/<int:review_id>/status', methods=['POST'])
@@ -5491,9 +5528,11 @@ def guides_admin_review_status(review_id):
         if res.rowcount == 0:
             return jsonify({"error": "Review not found."}), 404
         return jsonify({"message": "Updated."}), 200
-    except Exception as e:
+    except IntegrityError:
         db.session.rollback()
-        return jsonify({"error": str(e)}), 500
+        return jsonify({"error": "This phone number already has another live review for this guide."}), 409
+    except Exception as e:
+        return _g_fail(e)
 
 
 @bp.route('/api/admin/guide-reviews/<int:review_id>', methods=['DELETE'])
@@ -5506,5 +5545,4 @@ def guides_admin_review_delete(review_id):
             return jsonify({"error": "Review not found."}), 404
         return jsonify({"message": "Review deleted."}), 200
     except Exception as e:
-        db.session.rollback()
-        return jsonify({"error": str(e)}), 500
+        return _g_fail(e)
