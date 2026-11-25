@@ -109,7 +109,7 @@ run("contribute: parameters", patch_regex(
 bad = [(l, s) for l, s in steps if s not in ("changed", "already done")]
 print("Result:")
 for label, status in steps:
-    print(f"  {'OK ' if (label, status) not in bad else 'FAIL'}  {label}: {status}")
+    print(f"  {'OK. ' if (label, status) not in bad else 'FAIL'}  {label}: {status}")
 
 if bad:
     print("\nNothing was changed in your file.")
