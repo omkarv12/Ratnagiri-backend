@@ -5089,3 +5089,422 @@ def admin_delete_reel(reel_id):
     except Exception as e:
         db.session.rollback()
         return jsonify(error=str(e)), 500
+
+    # ===========================================================================
+# TOUR GUIDES  -> paste at the very END of main.py
+#
+# Needs the tables from database/guides.sql.
+# Uses things already defined in main.py: bp, db, text, request, jsonify, re,
+# _rows, _scalar, _clean, admin_required.
+# If you pasted the earlier SQLAlchemy-model version (class Guide / GuideEnquiry),
+# DELETE it first, otherwise Flask will complain about duplicate routes.
+# ===========================================================================
+
+GUIDE_STATUSES = ("pending", "approved", "rejected")
+GUIDE_ENQUIRY_STATUSES = ("new", "forwarded", "closed")
+# False = new reviews wait for admin approval. True = they appear immediately.
+GUIDE_REVIEWS_AUTO_APPROVE = False
+
+_G_EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+
+_G_PUBLIC_COLS = """g.id, g.guide_name, g.registration_no, g.languages, g.destinations,
+    g.base_village, g.taluka_name, g.district_name, g.experience_years, g.about, g.guide_photo"""
+
+# Rating numbers shown on cards: overall average, count, and the 5 newest ratings.
+_G_RATING_COLS = """
+    COALESCE((SELECT ROUND(AVG(r.rating)::numeric, 1)::float8 FROM guide_reviews r
+              WHERE r.guide_id = g.id AND r.status = 'approved'), 0) AS avg_rating,
+    (SELECT COUNT(*) FROM guide_reviews r
+      WHERE r.guide_id = g.id AND r.status = 'approved') AS rating_count,
+    COALESCE((SELECT json_agg(x.rating ORDER BY x.created_at DESC)
+              FROM (SELECT rating, created_at FROM guide_reviews
+                    WHERE guide_id = g.id AND status = 'approved'
+                    ORDER BY created_at DESC LIMIT 5) x), '[]'::json) AS last_ratings
+"""
+
+
+def _g_digits10(value):
+    return re.sub(r"\D", "", str(value or ""))[-10:]
+
+
+def _g_langs(value):
+    if isinstance(value, str):
+        value = value.split(",")
+    items = [x.strip().lower() for x in (value or []) if isinstance(x, str) and x.strip()]
+    return ",".join(dict.fromkeys(items))
+
+
+def _g_int(value, lo, hi, default=0):
+    try:
+        return max(lo, min(hi, int(value)))
+    except (TypeError, ValueError):
+        return default
+
+
+def _g_counts():
+    counts = {s: 0 for s in GUIDE_STATUSES}
+    for r in _rows("SELECT status, COUNT(*) AS n FROM guides GROUP BY status"):
+        counts[r["status"]] = r["n"]
+    counts["pending_reviews"] = _scalar("SELECT COUNT(*) FROM guide_reviews WHERE status = 'pending'")
+    return counts
+
+
+def _g_review_counts():
+    counts = {s: 0 for s in GUIDE_STATUSES}
+    for r in _rows("SELECT status, COUNT(*) AS n FROM guide_reviews GROUP BY status"):
+        counts[r["status"]] = r["n"]
+    counts["pending_guides"] = _scalar("SELECT COUNT(*) FROM guides WHERE status = 'pending'")
+    return counts
+
+
+# ------------------------------ public routes -------------------------------
+
+@bp.route('/api/guides', methods=['GET'])
+def guides_list():
+    """Approved guides with rating summary. No phone / email."""
+    try:
+        rows = _rows(f"""
+            SELECT {_G_PUBLIC_COLS}, {_G_RATING_COLS}
+            FROM guides g WHERE g.status = 'approved'
+            ORDER BY g.guide_name
+        """)
+        return jsonify(rows), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@bp.route('/api/guides/<int:guide_id>', methods=['GET'])
+def guides_detail(guide_id):
+    """One approved guide + approved reviews (reviewer phone / email never returned)."""
+    try:
+        rows = _rows(f"""
+            SELECT {_G_PUBLIC_COLS}, {_G_RATING_COLS}
+            FROM guides g WHERE g.id = :id AND g.status = 'approved'
+        """, {"id": guide_id})
+        if not rows:
+            return jsonify({"error": "Guide not found."}), 404
+        guide = rows[0]
+        guide["reviews"] = _rows("""
+            SELECT id, reviewer_name, rating, message, created_at::text AS created_at
+            FROM guide_reviews
+            WHERE guide_id = :id AND status = 'approved'
+            ORDER BY created_at DESC LIMIT 100
+        """, {"id": guide_id})
+        return jsonify(guide), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@bp.route('/api/guides/register', methods=['POST'])
+def guides_register():
+    try:
+        d = request.get_json(silent=True) or {}
+        if d.get("website"):   # honeypot
+            return jsonify({"message": "Thank you! Your registration was submitted."}), 201
+
+        v = {
+            "guide_name": _clean(d.get("guide_name"), 150),
+            "phone_number": _g_digits10(d.get("phone_number")),
+            "email": _clean(d.get("email"), 150),
+            "languages": _g_langs(d.get("languages")),
+            "destinations": _clean(d.get("destinations"), 1000),
+            "base_village": _clean(d.get("base_village"), 150),
+            "taluka_name": _clean(d.get("taluka_name"), 100),
+            "guide_photo": _clean(d.get("guide_photo"), 1000),
+        }
+        missing = [k for k, val in v.items() if not val]
+        if missing:
+            return jsonify({"error": f"Missing required fields: {', '.join(missing)}"}), 400
+        if len(v["phone_number"]) != 10:
+            return jsonify({"error": "Enter a valid 10-digit phone number."}), 400
+        if not _G_EMAIL_RE.match(v["email"]):
+            return jsonify({"error": "Enter a valid email address."}), 400
+        if not v["guide_photo"].startswith("https://"):
+            return jsonify({"error": "Photo link must start with https://"}), 400
+
+        dup = db.session.execute(text("""
+            SELECT 1 FROM guides WHERE phone_number = :p AND status IN ('pending','approved')
+        """), {"p": v["phone_number"]}).first()
+        if dup:
+            return jsonify({"error": "A guide with this phone number is already registered or awaiting approval."}), 409
+
+        v["district_name"] = _clean(d.get("district_name"), 100) or "Ratnagiri"
+        v["experience_years"] = _g_int(d.get("experience_years"), 0, 60)
+        v["license_number"] = _clean(d.get("license_number"), 80) or None
+        v["about"] = _clean(d.get("about"), 1500) or None
+
+        db.session.execute(text("""
+            INSERT INTO guides (guide_name, phone_number, email, languages, destinations,
+                base_village, taluka_name, district_name, experience_years,
+                license_number, about, guide_photo)
+            VALUES (:guide_name, :phone_number, :email, :languages, :destinations,
+                :base_village, :taluka_name, :district_name, :experience_years,
+                :license_number, :about, :guide_photo)
+        """), v)
+        db.session.commit()
+        return jsonify({"message": "Thank you! Your registration was submitted. It will appear on the Tour Guides page once the department approves it."}), 201
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({"error": str(e)}), 500
+
+
+@bp.route('/api/guide-enquiries', methods=['POST'])
+def guides_create_enquiry():
+    """Tourist request. guide_id is optional (null = 'find me any guide')."""
+    try:
+        d = request.get_json(silent=True) or {}
+        name = _clean(d.get("tourist_name"), 150)
+        phone = _g_digits10(d.get("phone_number"))
+        email = _clean(d.get("email"), 150) or None
+        if not name:
+            return jsonify({"error": "Please enter your name."}), 400
+        if len(phone) != 10:
+            return jsonify({"error": "Enter a valid 10-digit phone number."}), 400
+        if email and not _G_EMAIL_RE.match(email):
+            return jsonify({"error": "Enter a valid email address."}), 400
+
+        guide_id = d.get("guide_id")
+        if guide_id not in (None, ""):
+            guide_id = _g_int(guide_id, 1, 2**31 - 1, default=0)
+            ok = db.session.execute(
+                text("SELECT 1 FROM guides WHERE id = :id AND status = 'approved'"), {"id": guide_id}).first()
+            if not ok:
+                return jsonify({"error": "This guide is no longer available."}), 404
+        else:
+            guide_id = None
+
+        group = d.get("group_size")
+        db.session.execute(text("""
+            INSERT INTO guide_enquiries (guide_id, tourist_name, phone_number, email, destination,
+                language, travel_date, group_size, message)
+            VALUES (:guide_id, :name, :phone, :email, :destination,
+                :language, :travel_date, :group_size, :message)
+        """), {
+            "guide_id": guide_id, "name": name, "phone": phone, "email": email,
+            "destination": _clean(d.get("destination"), 200) or None,
+            "language": _clean(d.get("language"), 60) or None,
+            "travel_date": _clean(d.get("travel_date"), 20) or None,
+            "group_size": _g_int(group, 1, 200) if group not in (None, "") else None,
+            "message": _clean(d.get("message"), 1500) or None,
+        })
+        db.session.commit()
+        return jsonify({"message": "Request sent! The department will connect you with a guide soon."}), 201
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({"error": str(e)}), 500
+
+
+@bp.route('/api/guides/<int:guide_id>/reviews', methods=['POST'])
+def guides_add_review(guide_id):
+    """Tourist rating: name + phone + email + stars + message."""
+    try:
+        d = request.get_json(silent=True) or {}
+        if d.get("website"):   # honeypot
+            return jsonify({"message": "Thank you for your review!"}), 201
+
+        name = _clean(d.get("reviewer_name"), 150)
+        phone = _g_digits10(d.get("phone_number"))
+        email = _clean(d.get("email"), 150) or None
+        message = _clean(d.get("message"), 1000) or None
+        try:
+            rating = int(d.get("rating"))
+        except (TypeError, ValueError):
+            rating = 0
+
+        if not name:
+            return jsonify({"error": "Please enter your name."}), 400
+        if len(phone) != 10:
+            return jsonify({"error": "Enter a valid 10-digit phone number."}), 400
+        if email and not _G_EMAIL_RE.match(email):
+            return jsonify({"error": "Enter a valid email address."}), 400
+        if not 1 <= rating <= 5:
+            return jsonify({"error": "Choose a rating from 1 to 5 stars."}), 400
+
+        ok = db.session.execute(
+            text("SELECT 1 FROM guides WHERE id = :id AND status = 'approved'"), {"id": guide_id}).first()
+        if not ok:
+            return jsonify({"error": "Guide not found."}), 404
+
+        dup = db.session.execute(text("""
+            SELECT 1 FROM guide_reviews
+            WHERE guide_id = :g AND phone_number = :p AND status IN ('pending','approved')
+        """), {"g": guide_id, "p": phone}).first()
+        if dup:
+            return jsonify({"error": "You have already reviewed this guide with this phone number."}), 409
+
+        status = "approved" if GUIDE_REVIEWS_AUTO_APPROVE else "pending"
+        db.session.execute(text("""
+            INSERT INTO guide_reviews (guide_id, reviewer_name, phone_number, email, rating, message, status)
+            VALUES (:g, :name, :phone, :email, :rating, :message, :status)
+        """), {"g": guide_id, "name": name, "phone": phone, "email": email,
+               "rating": rating, "message": message, "status": status})
+        db.session.commit()
+
+        msg = ("Thank you for your review!" if status == "approved"
+               else "Thank you! Your review will appear after the department approves it.")
+        return jsonify({"message": msg, "status": status}), 201
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({"error": str(e)}), 500
+
+
+# ------------------------------ admin routes --------------------------------
+
+@bp.route('/api/admin/guides', methods=['GET'])
+@admin_required
+def guides_admin_list():
+    try:
+        status = request.args.get("status", "pending")
+        rows = _rows("""
+            SELECT g.id, g.guide_name, g.registration_no, g.languages, g.destinations,
+                   g.base_village, g.taluka_name, g.district_name, g.experience_years,
+                   g.about, g.guide_photo, g.phone_number, g.email, g.license_number,
+                   g.status, g.admin_note,
+                   g.created_at::text AS created_at, g.reviewed_at::text AS reviewed_at
+            FROM guides g
+            WHERE (:status = 'all' OR g.status = :status)
+            ORDER BY g.created_at DESC
+        """, {"status": status})
+        return jsonify({"guides": rows, "counts": _g_counts()}), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@bp.route('/api/admin/guides/<int:guide_id>/approve', methods=['POST'])
+@admin_required
+def guides_admin_approve(guide_id):
+    try:
+        row = db.session.execute(text("""
+            UPDATE guides SET
+                status = 'approved', reviewed_at = NOW(), admin_note = NULL,
+                registration_no = COALESCE(registration_no,
+                    'RTN-LG-' || EXTRACT(YEAR FROM NOW())::int::text || '-' || LPAD(id::text, 4, '0'))
+            WHERE id = :id
+            RETURNING guide_name, registration_no
+        """), {"id": guide_id}).mappings().first()
+        if row is None:
+            db.session.rollback()
+            return jsonify({"error": "Guide not found."}), 404
+        db.session.commit()
+        return jsonify({"message": f"{row['guide_name']} approved ({row['registration_no']})."}), 200
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({"error": str(e)}), 500
+
+
+@bp.route('/api/admin/guides/<int:guide_id>/reject', methods=['POST'])
+@admin_required
+def guides_admin_reject(guide_id):
+    try:
+        note = _clean((request.get_json(silent=True) or {}).get("note"), 500) or None
+        row = db.session.execute(text("""
+            UPDATE guides SET status = 'rejected', reviewed_at = NOW(), admin_note = :note
+            WHERE id = :id RETURNING guide_name
+        """), {"id": guide_id, "note": note}).mappings().first()
+        if row is None:
+            db.session.rollback()
+            return jsonify({"error": "Guide not found."}), 404
+        db.session.commit()
+        return jsonify({"message": f"{row['guide_name']} rejected."}), 200
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({"error": str(e)}), 500
+
+
+@bp.route('/api/admin/guides/<int:guide_id>', methods=['DELETE'])
+@admin_required
+def guides_admin_delete(guide_id):
+    """Reviews are deleted with the guide; enquiries are kept (guide_id becomes NULL)."""
+    try:
+        res = db.session.execute(text("DELETE FROM guides WHERE id = :id"), {"id": guide_id})
+        db.session.commit()
+        if res.rowcount == 0:
+            return jsonify({"error": "Guide not found."}), 404
+        return jsonify({"message": "Guide deleted."}), 200
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({"error": str(e)}), 500
+
+
+@bp.route('/api/admin/guide-enquiries', methods=['GET'])
+@admin_required
+def guides_admin_enquiries():
+    try:
+        rows = _rows("""
+            SELECT e.id, e.guide_id, g.guide_name, e.tourist_name, e.phone_number, e.email,
+                   e.destination, e.language, e.travel_date, e.group_size, e.message,
+                   e.status, e.created_at::text AS created_at
+            FROM guide_enquiries e LEFT JOIN guides g ON g.id = e.guide_id
+            ORDER BY e.created_at DESC LIMIT 300
+        """)
+        return jsonify({"enquiries": rows}), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@bp.route('/api/admin/guide-enquiries/<int:enquiry_id>/status', methods=['POST'])
+@admin_required
+def guides_admin_enquiry_status(enquiry_id):
+    try:
+        status = (request.get_json(silent=True) or {}).get("status")
+        if status not in GUIDE_ENQUIRY_STATUSES:
+            return jsonify({"error": "Invalid status."}), 400
+        res = db.session.execute(
+            text("UPDATE guide_enquiries SET status = :s WHERE id = :id"), {"s": status, "id": enquiry_id})
+        db.session.commit()
+        if res.rowcount == 0:
+            return jsonify({"error": "Request not found."}), 404
+        return jsonify({"message": "Updated."}), 200
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({"error": str(e)}), 500
+
+
+@bp.route('/api/admin/guide-reviews', methods=['GET'])
+@admin_required
+def guides_admin_reviews():
+    try:
+        status = request.args.get("status", "pending")
+        rows = _rows("""
+            SELECT r.id, r.guide_id, g.guide_name, r.reviewer_name, r.phone_number, r.email,
+                   r.rating, r.message, r.status, r.created_at::text AS created_at
+            FROM guide_reviews r JOIN guides g ON g.id = r.guide_id
+            WHERE (:status = 'all' OR r.status = :status)
+            ORDER BY r.created_at DESC LIMIT 300
+        """, {"status": status})
+        return jsonify({"reviews": rows, "counts": _g_review_counts()}), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@bp.route('/api/admin/guide-reviews/<int:review_id>/status', methods=['POST'])
+@admin_required
+def guides_admin_review_status(review_id):
+    try:
+        status = (request.get_json(silent=True) or {}).get("status")
+        if status not in GUIDE_STATUSES:
+            return jsonify({"error": "Invalid status."}), 400
+        res = db.session.execute(text("""
+            UPDATE guide_reviews SET status = :s, reviewed_at = NOW() WHERE id = :id
+        """), {"s": status, "id": review_id})
+        db.session.commit()
+        if res.rowcount == 0:
+            return jsonify({"error": "Review not found."}), 404
+        return jsonify({"message": "Updated."}), 200
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({"error": str(e)}), 500
+
+
+@bp.route('/api/admin/guide-reviews/<int:review_id>', methods=['DELETE'])
+@admin_required
+def guides_admin_review_delete(review_id):
+    try:
+        res = db.session.execute(text("DELETE FROM guide_reviews WHERE id = :id"), {"id": review_id})
+        db.session.commit()
+        if res.rowcount == 0:
+            return jsonify({"error": "Review not found."}), 404
+        return jsonify({"message": "Review deleted."}), 200
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({"error": str(e)}), 500
