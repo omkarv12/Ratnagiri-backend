@@ -262,7 +262,7 @@ def index():
 @bp.route('/api/youtube-videos', methods=['GET'])
 def get_youtube_videos():
     try:
-                playlist_id = request.args.get('playlist') or os.environ.get('YOUTUBE_PLAYLIST_ID')
+        playlist_id = request.args.get('playlist') or os.environ.get('YOUTUBE_PLAYLIST_ID')
         if playlist_id and not re.fullmatch(r"[A-Za-z0-9_-]{10,60}", playlist_id):
             return jsonify({"success": False, "error": "Invalid playlist."}), 400  
         api_key = os.environ.get('YOUTUBE_API_KEY')
